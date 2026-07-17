@@ -1,0 +1,71 @@
+# Isolates whether REPEATED linear_gpu calls across many iterations (mimicking
+# the real decoder's ~440-step greedy loop: many small MLP-sized calls, then
+# occasionally one huge vocab-sized call) is what triggers the bug — every
+# earlier repro only ever called linear_gpu once per process.
+use io
+use math
+use math_gpu
+
+let int D      = 384
+let int D_OUT  = 51865
+let int STEPS  = 30
+
+pub req [float] mk(int n, float scale, float bias):
+    var [float] out = []
+    for i in 0..n:
+        out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
+    out
+
+def main() throws:
+    print "=== repeated linear_gpu calls, checking the big one each time ==="
+
+    let [float] fc_w = mk(D * (D * 4), 0.1, 0.05)
+    let [float] fc_b = mk(D * 4, 0.05, 0.02)
+    let [float] pr_w = mk((D * 4) * D, 0.1, 0.05)
+    let [float] pr_b = mk(D, 0.05, 0.02)
+    let [float] vocab_w = mk(D * D_OUT, 0.2, 0.1)
+
+    # linear_gpu now expects its weight pre-transposed (see its doc comment) --
+    # transpose once here, matching model.br's load-time pre-transpose. The CPU
+    # reference below intentionally keeps using the ORIGINAL (untransposed)
+    # `vocab_w` -- it's an independent check, not meant to assume the fix.
+    let [float] fc_w_t    = transpose_flat(fc_w, D * 4, D)
+    let [float] pr_w_t    = transpose_flat(pr_w, D, D * 4)
+    let [float] vocab_w_t = transpose_flat(vocab_w, D_OUT, D)
+
+    var int step = 0
+    var float max_diff_ever = 0.0
+    while step < STEPS:
+        let [float] x = mk(D, 0.3 + float(step) * 0.001, 0.1)
+
+        # Small MLP-shaped calls, like every decoder block does every step.
+        let [float] fc  = linear_gpu(x, fc_w_t.clone(), fc_b.clone(), 1, D, D * 4)
+        let [float] act = gelu_gpu(fc)
+        let [float] pr  = linear_gpu(act, pr_w_t.clone(), pr_b.clone(), 1, D * 4, D)
+
+        # The big vocab-sized call, like the final logits projection.
+        let [float] gpu_out = linear_gpu(pr.clone(), vocab_w_t.clone(), zeros(D_OUT), 1, D, D_OUT)
+
+        # CPU reference for the big call only (cheap enough to check every step).
+        var float cpu0 = 0.0
+        var float cpu57 = 0.0
+        var float cpu25000 = 0.0
+        var int i = 0
+        while i < D:
+            cpu0 += pr[i] * vocab_w[0 * D + i]
+            cpu57 += pr[i] * vocab_w[57 * D + i]
+            cpu25000 += pr[i] * vocab_w[25000 * D + i]
+            i += 1
+
+        let d0 = if cpu0 > gpu_out[0]: cpu0 - gpu_out[0] else: gpu_out[0] - cpu0
+        let d57 = if cpu57 > gpu_out[57]: cpu57 - gpu_out[57] else: gpu_out[57] - cpu57
+        let d25000 = if cpu25000 > gpu_out[25000]: cpu25000 - gpu_out[25000] else: gpu_out[25000] - cpu25000
+        var float step_max = d0
+        if d57 > step_max: step_max = d57
+        if d25000 > step_max: step_max = d25000
+        if step_max > max_diff_ever: max_diff_ever = step_max
+
+        print "step {step}: gpu[0]={gpu_out[0]:.4f} cpu[0]={cpu0:.4f}  gpu[57]={gpu_out[57]:.4f} cpu[57]={cpu57:.4f}  gpu[25000]={gpu_out[25000]:.4f} cpu[25000]={cpu25000:.4f}  diff={step_max:.6f}"
+        step += 1
+
+    print "max diff across all steps = {max_diff_ever:.8f}"

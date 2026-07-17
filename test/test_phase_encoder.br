@@ -1,0 +1,16 @@
+# Phase-isolation: load weights + mel + encoder, then STOP (skip decode).
+# Used to split the ~3-minute full pipeline's wall-clock into
+# (weight-load + mel + encoder) vs (decoder loop), via separate `time`d runs.
+use model
+
+def main() throws:
+    var Whisper w = load_whisper("weights/tiny.wbrf", "weights/tokenizer", ModelSize.Tiny)
+    print "[diag] weights loaded"
+
+    let [float] samples = load_wav("test/test10s.wav")
+    print "[diag] loaded {samples.length} samples"
+    let MelSpectrogram mel = log_mel_spectrogram(samples)
+    print "[diag] mel: {mel.n_frames} frames"
+    let [float] audio = w.encoder.forward(mel)
+    print "[diag] encoder done, audio.length={audio.length}"
+    print "[diag] audio[0]={audio[0]:.6f} audio[100]={audio[100]:.6f} audio[1000]={audio[1000]:.6f} audio[287999]={audio[287999]:.6f} audio[575999]={audio[575999]:.6f}"

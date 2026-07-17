@@ -1,0 +1,40 @@
+# test/test_wav_only.br — test only load_wav (no mel spectrogram)
+use io
+use audio
+
+def main() throws:
+    let string wav_path = "test/tiny.wav"
+
+    # ── Raw bytes ────────────────────────────────────────────────────────────
+    let [uint8] bytes = fs.readBytes(wav_path)
+    print "File size: {bytes.length} bytes"
+
+    let int b0 = int(bytes[0])
+    let int b1 = int(bytes[1])
+    let int b2 = int(bytes[2])
+    let int b3 = int(bytes[3])
+    print "Magic: {b0} {b1} {b2} {b3}  (expect 82 73 70 70 = RIFF)"
+
+    let int sr  = read_u32_le(bytes, 24)
+    let int ch  = read_u16_le(bytes, 22)
+    let int bps = read_u16_le(bytes, 34)
+    print "Sample rate: {sr} Hz  channels: {ch}  bits: {bps}"
+
+    # ── load_wav ─────────────────────────────────────────────────────────────
+    print "Loading WAV..."
+    let [float] samples = load_wav(wav_path)
+    print "Samples: {samples.length}  (expect 16000)"
+
+    let float s0    = samples[0]
+    let float s100  = samples[100]
+    print "samples[0]   = {s0:.6f}  (440 Hz sine, expect ~0)"
+    print "samples[100] = {s100:.6f}"
+
+    var float vmin = samples[0]
+    var float vmax = samples[0]
+    for s in samples:
+        if s < vmin: vmin = s
+        if s > vmax: vmax = s
+    print "range: [{vmin:.4f}, {vmax:.4f}]  (expect ~[-1, 1])"
+
+    print "WAV test passed."

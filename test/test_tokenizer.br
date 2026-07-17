@@ -1,0 +1,24 @@
+# test/test_tokenizer.br — test load_tokenizer (vocab.json + merges.txt parsing)
+use tokenizer
+
+def main() throws:
+    let string tok_dir = "test/tokenizer"
+    print "Loading tokenizer..."
+    let Tokenizer tok = load_tokenizer(tok_dir)
+
+    let int n_vocab = tok.vocab.length
+    print "Vocab size: {n_vocab}  (expect 4)"
+
+    let int id_eot = tok.vocab["<|endoftext|>"]
+    let int id_sot = tok.vocab["<|startoftranscript|>"]
+    print "EOT id: {id_eot}  (expect 50256)"
+    print "SOT id: {id_sot}  (expect 50257)"
+
+    let int id_hello = tok.vocab["hello"]
+    print "hello id: {id_hello}  (expect 1)"
+
+    # Test reverse lookup
+    let string tok_eot = tok.reverse[50256]
+    print "reverse[50256]: '{tok_eot}'  (expect '<|endoftext|>')"
+
+    print "Tokenizer test passed."

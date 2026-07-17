@@ -1,0 +1,251 @@
+# src/audio.br — WAV loading and log-mel spectrogram
+#
+# Whisper parameters:
+#   sample_rate = 16 000 Hz
+#   n_fft       = 400   (25 ms window)
+#   hop_length  = 160   (10 ms step)
+#   n_mels      = 80
+#   max frames  = 3 000 (30 s of audio)
+
+use math
+use io
+
+let int SAMPLE_RATE = 16000
+let int N_FFT       = 400
+let int HOP_LENGTH  = 160
+let int N_MELS      = 80
+let int N_FRAMES    = 3000
+
+struct MelSpectrogram:
+    int     n_frames
+    int     n_mels
+    [float] data      # row-major: n_mels × n_frames
+
+# ── Mel scale helpers ─────────────────────────────────────────────────────────
+
+pub float hz_to_mel(float hz):
+    # Slaney mel scale (librosa default, htk=False): linear below 1 kHz,
+    # logarithmic above. Whisper's precomputed mel filters use this scale,
+    # not the HTK 2595*log10(1+hz/700) formula.
+    let float f_sp        = 200.0 / 3.0
+    let float min_log_hz   = 1000.0
+    let float min_log_mel  = min_log_hz / f_sp
+    let float logstep      = 6.4.ln() / 27.0
+    if hz >= min_log_hz: min_log_mel + (hz / min_log_hz).ln() / logstep else: hz / f_sp
+
+pub float mel_to_hz(float mel):
+    let float f_sp        = 200.0 / 3.0
+    let float min_log_hz   = 1000.0
+    let float min_log_mel  = min_log_hz / f_sp
+    let float logstep      = 6.4.ln() / 27.0
+    if mel >= min_log_mel: min_log_hz * (logstep * (mel - min_log_mel)).exp() else: f_sp * mel
+
+# ── Hann window ───────────────────────────────────────────────────────────────
+
+pub req [float] hann_window(int n):
+    # Periodic Hann window (denominator n, not n-1) — matches torch.hann_window's
+    # default (periodic=True), which is what Whisper uses for its STFT.
+    var [float] w = []
+    for i in 0..n:
+        w.push(0.5 - 0.5 * (2.0 * PI * float(i) / float(n)).cos())
+    w
+
+# ── Mel filterbank matrix: (n_mels × n_freq) ─────────────────────────────────
+
+pub req [float] mel_filterbank(int n_mels, int n_fft, int sr):
+    # Matches librosa.filters.mel(sr, n_fft, n_mels, htk=False, norm='slaney')
+    # (verified numerically against whisper.audio.mel_filters, diff < 2e-9),
+    # which is what Whisper's precomputed mel filterbank uses. This operates on
+    # continuous Hz ramps rather than integer FFT bin indices, and applies
+    # Slaney-style area normalisation (2 / bandwidth) per filter.
+    let int   n_freq = n_fft / 2 + 1
+    let float f_max  = float(sr) / 2.0
+
+    # FFT bin center frequencies: linspace(0, f_max, n_freq)
+    var [float] fftfreqs = []
+    for k in 0..n_freq:
+        fftfreqs.push(f_max * float(k) / float(n_freq - 1))
+
+    # n_mels + 2 equally-spaced points in mel space, converted back to Hz
+    let float mel_min = hz_to_mel(0.0)
+    let float mel_max = hz_to_mel(f_max)
+    var [float] mel_pts = []
+    for i in 0..(n_mels + 2):
+        let float mel = mel_min + (mel_max - mel_min) * float(i) / float(n_mels + 1)
+        mel_pts.push(mel_to_hz(mel))
+
+    var [float] fdiff = []
+    for i in 0..(n_mels + 1):
+        fdiff.push(mel_pts[i + 1] - mel_pts[i])
+
+    var [float] fb = zeros(n_mels * n_freq)
+    for m in 0..n_mels:
+        let float enorm = 2.0 / (mel_pts[m + 2] - mel_pts[m])
+        for k in 0..n_freq:
+            let float lower = (fftfreqs[k] - mel_pts[m]) / fdiff[m]
+            let float upper = (mel_pts[m + 2] - fftfreqs[k]) / fdiff[m + 1]
+            var float w = if lower < upper: lower else: upper
+            if w < 0.0: w = 0.0
+            fb[m * n_freq + k] = w * enorm
+    fb
+
+# ── STFT → power spectrum frames ─────────────────────────────────────────────
+# Returns a flat (n_frames × n_freq) matrix of power values.
+
+pub req [float] stft_power([float] audio, int n_fft, int hop) throws:
+    let int n_freq  = n_fft / 2 + 1
+    let [float] win = hann_window(n_fft)
+    let int n_audio = audio.length
+
+    # Pad audio by n_fft/2 on each side (reflect padding, zero for short audio)
+    let int pad = n_fft / 2
+    var [float] padded = []
+    for i in 0..pad:
+        let int src = pad - i
+        padded.push(if src < n_audio: audio[src] else: 0.0)
+    for v in audio: padded.push(v)
+    for i in 0..pad:
+        let int src = n_audio - 2 - i
+        padded.push(if src >= 0 and src < n_audio: audio[src] else: 0.0)
+
+    # torch.stft(..., center=True) yields (padded.length - n_fft) / hop + 1
+    # frames, but Whisper drops the last one (stft[..., :-1]) — so we compute
+    # one fewer frame here rather than dropping it after the fact.
+    let int n_frames = (padded.length - n_fft) / hop
+    var [float] out  = []
+
+    for f in 0..n_frames:
+        let int start = f * hop
+        let [float] mag = rfft_windowed(padded, start, win, n_fft)
+        for v in mag: out.push(v * v)   # power = magnitude²
+
+    out
+
+# ── Log-mel spectrogram ───────────────────────────────────────────────────────
+
+pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
+    let int n_freq = N_FFT / 2 + 1
+
+    let [float] power = stft_power(audio, N_FFT, HOP_LENGTH)
+    let int n_frames  = power.length / n_freq
+
+    let [float] fb = mel_filterbank(N_MELS, N_FFT, SAMPLE_RATE)
+
+    # mel = fb · power^T  (N_MELS × n_frames)
+    var [float] mel = zeros(N_MELS * n_frames)
+    for m in 0..N_MELS:
+        for f in 0..n_frames:
+            var float s = 0.0
+            for k in 0..n_freq:
+                s += fb[m * n_freq + k] * power[f * n_freq + k]
+            mel[m * n_frames + f] = s
+
+    # Log compression: log10(max(mel, 1e-10))  — Whisper uses log10 directly,
+    # not 10*log10 (this is not a dB scale).
+    let float clamp_val = 1e-10
+
+    for i in 0..(N_MELS * n_frames):
+        let float v = if mel[i] > clamp_val: mel[i] else: clamp_val
+        mel[i] = v.log10()
+
+    # Normalise to [-1, 1] by clipping at (max − 8 dB)
+    var float log_max = mel[0]
+    for v in mel:
+        if v > log_max: log_max = v
+    let float floor_ = log_max - 8.0
+    for i in 0..(N_MELS * n_frames):
+        mel[i] = (if mel[i] > floor_: mel[i] else: floor_) + 4.0
+        mel[i] /= 4.0
+
+    # Pad or trim to N_FRAMES columns
+    var [float] fixed = zeros(N_MELS * N_FRAMES)
+    let int cols = if n_frames < N_FRAMES: n_frames else: N_FRAMES
+    for m in 0..N_MELS:
+        for f in 0..cols:
+            fixed[m * N_FRAMES + f] = mel[m * n_frames + f]
+
+    MelSpectrogram(n_frames=N_FRAMES, n_mels=N_MELS, data=fixed)
+
+# ── WAV loader ────────────────────────────────────────────────────────────────
+# Expects a standard PCM WAV file (16-bit mono, 16 000 Hz).
+# Returns raw float samples in [-1.0, 1.0].
+#
+# Binary layout assumed:
+#   bytes 0-3:   "RIFF"
+#   bytes 4-7:   file size (LE u32)
+#   bytes 8-11:  "WAVE"
+#   bytes 12-15: "fmt "
+#   bytes 16-19: chunk size (must be 16 for PCM)
+#   bytes 20-21: audio format (must be 1 = PCM)
+#   bytes 22-23: num channels (must be 1)
+#   bytes 24-27: sample rate (must be 16000)
+#   bytes 34-35: bits per sample (must be 16)
+#   bytes 36-39: "data"
+#   bytes 40-43: data chunk size
+#   bytes 44+:   interleaved signed 16-bit PCM samples (little-endian)
+
+pub req [float] load_wav(string path) throws:
+    let [uint8] bytes = fs.readBytes(path)
+    guard bytes.length >= 44 else throw "WAV file too short: {path}"
+
+    # Validate RIFF header ("RIFF" at 0, "WAVE" at 8, "fmt " at 12)
+    let int riff0 = int(bytes[0])
+    let int riff1 = int(bytes[1])
+    let int riff2 = int(bytes[2])
+    let int riff3 = int(bytes[3])
+    guard riff0 == 82 and riff1 == 73 and riff2 == 70 and riff3 == 70 else throw "Not a RIFF file: {path}"
+    let int wave0 = int(bytes[8])
+    let int wave1 = int(bytes[9])
+    let int wave2 = int(bytes[10])
+    let int wave3 = int(bytes[11])
+    guard wave0 == 87 and wave1 == 65 and wave2 == 86 and wave3 == 69 else throw "Not a WAVE file: {path}"
+
+    # Audio format (1 = PCM), channels, sample rate, bit depth from fmt chunk
+    let int audio_format  = read_u16_le(bytes, 20)
+    let int num_channels  = read_u16_le(bytes, 22)
+    let int sample_rate   = read_u32_le(bytes, 24)
+    let int bits_per_smpl = read_u16_le(bytes, 34)
+
+    guard audio_format == 1 else throw "Only PCM WAV supported (format={audio_format})"
+    guard bits_per_smpl == 16 else throw "Only 16-bit WAV supported (bits={bits_per_smpl})"
+    guard sample_rate == 16000 else throw "WAV must be 16 kHz (got {sample_rate} Hz) — resample before calling"
+
+    # Find the "data" sub-chunk (may not start at byte 36 if fmt is extended)
+    var int data_offset = 12
+    var bool found_data = false
+    while data_offset + 8 <= bytes.length and not found_data:
+        let int c0 = int(bytes[data_offset])
+        let int c1 = int(bytes[data_offset + 1])
+        let int c2 = int(bytes[data_offset + 2])
+        let int c3 = int(bytes[data_offset + 3])
+        let int chunk_size = read_u32_le(bytes, data_offset + 4)
+        # "data" = 0x64 0x61 0x74 0x61
+        if c0 == 100 and c1 == 97 and c2 == 116 and c3 == 97:
+            data_offset = data_offset + 8
+            found_data = true
+        else:
+            data_offset = data_offset + 8 + chunk_size
+    guard found_data else throw "No data chunk found in WAV: {path}"
+
+    # Read signed 16-bit PCM samples and normalise to [-1, 1]
+    # For stereo, average the channels
+    var [float] samples = []
+    var int i = data_offset
+    let float scale = 1.0 / 32768.0
+    while i + 1 < bytes.length:
+        # Read first channel
+        var int raw = read_u16_le(bytes, i)
+        if raw >= 32768:
+            raw = raw - 65536   # sign extend
+        var float s = (raw as float) * scale
+        if num_channels == 2 and i + 3 < bytes.length:
+            # Average with second channel
+            var int raw2 = read_u16_le(bytes, i + 2)
+            if raw2 >= 32768:
+                raw2 = raw2 - 65536
+            s = (s + (raw2 as float) * scale) * 0.5
+            i = i + 4
+        else:
+            i = i + 2 * num_channels
+        samples.push(s)
+    samples

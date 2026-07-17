@@ -1,0 +1,5 @@
+use math
+
+def main():
+    let [float] fb = zeros(16080)
+    print "{fb.length}"

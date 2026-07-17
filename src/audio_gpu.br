@@ -1,0 +1,220 @@
+# src/audio_gpu.br — GPU-accelerated STFT and log-mel spectrogram
+#
+# Build targets:
+#   boring build --target cuda   # NVIDIA GPU
+#   boring build --target wgpu   # DirectX 12 / Vulkan / Metal (cross-platform)
+#   boring build --target metal  # Apple GPU (macOS / iOS)
+#
+# Interpreter simulation (sequential, for development):
+#   boring run test/test_mel_gpu.br
+#
+# Kernel design
+# ─────────────
+# StftPower  — one thread per STFT frame.  Each thread independently computes
+#              a direct DFT (n_fft/2+1 one-sided bins) via a precomputed
+#              cos/sin twiddle table indexed by (k*i) % n_fft.  No shared
+#              memory required, so the sequential interpreter simulation is
+#              correct.  n_fft=400 (Whisper's window size) is not a power of
+#              2, which rules out a radix-2 FFT here — the direct DFT works
+#              for any n_fft.  On a real GPU, all frames execute in parallel,
+#              giving an n_frames-fold speedup over CPU.
+#
+# MelApply   — one thread per (mel-band, frame) output cell.  Simple
+#              dot-product, fully parallel, no inter-thread dependency.
+#
+# LogCompress — one thread per element.  Element-wise log₁₀ with clamp.
+
+use math
+use audio
+
+# ── Kernel 1: STFT → power spectrum ──────────────────────────────────────────
+# Grid: ceil(n_frames / 256) blocks.   Block: 256 threads.
+# Thread (block.x * block_dim.x + thread.x) handles one STFT frame.
+# Each thread allocates its own twiddle table and x/re/im buffers → no
+# inter-thread sharing.
+
+kernel StftPower:
+    let [float]'global  audio      # reflect-padded audio
+    let [float]'global  win        # Hann window (n_fft values)
+    mut [float]'unified power      # output: n_frames × n_freq power values
+    let int             n_frames
+    let int             hop
+    let int             n_padded
+    let int             n_fft
+    let int             n_freq
+
+    init([float]'global a, [float]'global w, int nf, int h, int np, int nfft, int nfreq):
+        audio    = a
+        win      = w
+        n_frames = nf
+        hop      = h
+        n_padded = np
+        n_fft    = nfft
+        n_freq   = nfreq
+        power    = [0.0 for ..nf * nfreq]
+
+    def ():
+        let frame = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if frame < n_frames:
+            let start = frame * hop
+
+            # Windowed samples for this frame
+            var [float] x = []
+            for i in 0..n_fft:
+                let float s = if start + i < n_padded: audio[start + i] * win[i] else: 0.0
+                x.push(s)
+
+            # One period of cos/sin, reused via (k*i) % n_fft periodicity
+            var [float] cos_tab = []
+            var [float] sin_tab = []
+            for i in 0..n_fft:
+                let ang = -2.0 * PI * float(i) / float(n_fft)
+                cos_tab.push(ang.cos())
+                sin_tab.push(ang.sin())
+
+            # Direct DFT: one-sided power spectrum (n_freq bins)
+            let base = frame * n_freq
+            for k in 0..n_freq:
+                var float re = 0.0
+                var float im = 0.0
+                for i in 0..n_fft:
+                    let idx = (k * i) % n_fft
+                    re += x[i] * cos_tab[idx]
+                    im += x[i] * sin_tab[idx]
+                power[base + k] = re * re + im * im
+
+
+# ── Kernel 2: Mel filterbank dot-product ──────────────────────────────────────
+# Grid: ceil(n_frames / 256) blocks.   Block: 256 threads.
+# One thread per STFT frame.  Each thread computes ALL mel bands for its frame,
+# writing mel[m * n_frames + f] for m in 0..n_mels (non-overlapping across threads).
+#
+# Why "one thread per frame" rather than "one thread per (m, f) cell" ?
+# The parallel interpreter (rayon) creates one Interpreter per thread.
+# n_frames (~3000) threads amortize that overhead well; n_mels×n_frames (~240k)
+# threads would be dominated by interpreter instantiation cost.
+# On a real GPU both designs parallelise equally well — the GPU schedules
+# workgroups across SMs regardless of granularity.
+
+kernel MelApply:
+    let [float]'global  fb        # filterbank: n_mels × n_freq  (80 × 201)
+    let [float]'global  power     # STFT power:  n_frames × n_freq
+    mut [float]'unified mel       # output: n_mels × n_frames
+    let int             n_mels
+    let int             n_frames
+    let int             n_freq
+
+    init([float]'global f, [float]'global p, int nm, int nf, int nfq):
+        fb       = f
+        power    = p
+        mel      = [0.0 for ..nm * nf]
+        n_mels   = nm
+        n_frames = nf
+        n_freq   = nfq
+
+    def ():
+        let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if f < n_frames:
+            for m in 0..n_mels:
+                var float s = 0.0
+                for k in 0..n_freq:
+                    s += fb[m * n_freq + k] * power[f * n_freq + k]
+                mel[m * n_frames + f] = s
+
+
+# ── Kernel 3: Log compression ─────────────────────────────────────────────────
+# Grid: ceil(n_frames / 256) blocks.   Block: 256 threads.
+# One thread per frame, processes all n_mels bands for that frame.
+# Same granularity rationale as MelApply above.
+
+kernel LogCompress:
+    let [float]'global  mel_in
+    mut [float]'unified mel_out
+    let float           clamp_val
+    let int             n_mels
+    let int             n_frames
+
+    init([float]'global inp, float cv, int nm, int nf):
+        mel_in    = inp
+        mel_out   = [0.0 for ..nm * nf]
+        clamp_val = cv
+        n_mels    = nm
+        n_frames  = nf
+
+    def ():
+        let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if f < n_frames:
+            for m in 0..n_mels:
+                let i = m * n_frames + f
+                let v = if mel_in[i] > clamp_val: mel_in[i] else: clamp_val
+                mel_out[i] = v.log10()
+
+
+# ── GPU log-mel spectrogram ───────────────────────────────────────────────────
+# Drop-in replacement for log_mel_spectrogram() in audio.br.
+# STFT + mel filterbank run on the GPU; normalization needs a CPU reduction.
+
+pub req MelSpectrogram log_mel_spectrogram_gpu([float] audio) throws:
+    let int n_audio = audio.length
+    let int n_fft   = 400
+    let int hop     = 160
+    let int n_mels  = 80
+    let int n_freq  = n_fft / 2 + 1
+    let int pad     = n_fft / 2
+
+    # Reflect-pad audio
+    var [float] padded = []
+    for i in 0..pad:
+        let int src = pad - i
+        padded.push(if src < n_audio: audio[src] else: 0.0)
+    for v in audio: padded.push(v)
+    for i in 0..pad:
+        let int src = n_audio - 2 - i
+        padded.push(if src >= 0 and src < n_audio: audio[src] else: 0.0)
+
+    let int n_padded = padded.length
+    # Drop the last centered STFT frame, matching torch.stft(...)[..., :-1]
+    # (see audio.br's stft_power for the same computation).
+    let int n_frames = (n_padded - n_fft) / hop
+
+    let [float] win = hann_window(n_fft)
+    let [float] fb  = mel_filterbank(n_mels, n_fft, 16000)
+
+    # ── STFT (one thread per frame) ──────────────────────────────────────────
+    let int stft_blocks = (n_frames + 255) / 256
+    mut k_stft = StftPower(padded, win, n_frames, hop, n_padded, n_fft, n_freq)
+    kernel:
+        k_stft(block = 256, grid = stft_blocks)
+
+    # ── Mel filterbank (one thread per frame) ────────────────────────────────
+    let int mel_blocks = (n_frames + 255) / 256
+    mut k_mel = MelApply(fb, k_stft.power, n_mels, n_frames, n_freq)
+    kernel:
+        k_mel(block = 256, grid = mel_blocks)
+
+    # ── Log compression (one thread per frame) ────────────────────────────────
+    let [float] mel_raw = k_mel.mel
+    let float clamp_val = 1e-10
+
+    mut k_log = LogCompress(mel_raw, clamp_val, n_mels, n_frames)
+    kernel:
+        k_log(block = 256, grid = mel_blocks)
+
+    let [float] mel_log = k_log.mel_out
+
+    # ── Normalize (global max → CPU reduction) ────────────────────────────────
+    var float log_max = mel_log[0]
+    for v in mel_log:
+        if v > log_max: log_max = v
+    let float floor_ = log_max - 8.0
+
+    # Pad or trim to N_FRAMES = 3000 columns
+    let int cols = if n_frames < 3000: n_frames else: 3000
+    var [float] fixed = zeros(n_mels * 3000)
+    for m in 0..n_mels:
+        for f in 0..cols:
+            let float raw    = mel_log[m * n_frames + f]
+            let float normed = ((if raw > floor_: raw else: floor_) + 4.0) / 4.0
+            fixed[m * 3000 + f] = normed
+
+    MelSpectrogram(n_frames=3000, n_mels=n_mels, data=fixed)

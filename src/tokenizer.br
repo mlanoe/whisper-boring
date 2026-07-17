@@ -1,0 +1,178 @@
+# src/tokenizer.br — Whisper BPE tokenizer
+#
+# Whisper uses a byte-level BPE vocabulary of 51 865 tokens.
+# The vocab file is a JSON object mapping token strings to integer IDs,
+# and the merges file lists BPE merge rules one per line: "X Y".
+#
+# Special tokens (current multilingual tokenizer numbering — verify against
+# tools/export_weights.py's printed "Special token ids" if the installed
+# openai-whisper version changes):
+#   50257  <|endoftext|>
+#   50258  <|startoftranscript|>  (SOT)
+#   50259  <|en|>                 (language tag — English)
+#   50359  <|transcribe|>
+#   50363  <|notimestamps|>
+
+let int TOK_EOT            = 50257
+let int TOK_SOT            = 50258
+let int TOK_LANG_EN        = 50259
+let int TOK_TRANSCRIBE     = 50359
+let int TOK_NO_TIMESTAMPS  = 50363
+
+struct Tokenizer:
+    {string=int} vocab          # token string → id
+    {int=string} reverse        # id → token string
+    [[string]]   merges         # BPE merge rules as pairs [a, b]
+
+    # ── Encode ─────────────────────────────────────────────────────────────
+
+    req [int] encode(string text):
+        # 1. Convert text to a sequence of single-byte tokens (UTF-8 bytes
+        #    mapped to their byte-level representation in the vocab).
+        var [[string]] words = []
+        for ch in text.chars():
+            var [string] chars = []
+            chars.push("{ch}")
+            words.push(chars)
+
+        # 2. Apply BPE merge rules in order.
+        for merge in self.merges:
+            let string a = merge[0]
+            let string b = merge[1]
+            var [[string]] next_words = []
+            for word in words:
+                let [string] merged = self.apply_merge(word, a, b)
+                next_words.push(merged)
+            words = next_words
+
+        # 3. Map subword strings to IDs.
+        var [int] ids = []
+        for word in words:
+            for tok in word:
+                let int id = self.vocab[tok] else -1
+                if id >= 0: ids.push(id)
+        ids
+
+    req [string] apply_merge([string] word, string a, string b):
+        var [string] out = []
+        var int i = 0
+        while i < word.length:
+            if i < word.length - 1 and word[i] == a and word[i + 1] == b:
+                out.push("{a}{b}")
+                i += 2
+            else:
+                out.push(word[i])
+                i += 1
+        out
+
+    # ── Decode ─────────────────────────────────────────────────────────────
+
+    req string decode([int] ids):
+        var string out = ""
+        for id in ids:
+            let string tok = self.reverse[id] else ""
+            out = "{out}{tok}"
+        # Strip leading space that BPE commonly inserts
+        if out.length > 0 and out[0] == " ":
+            out = out[1..]
+        out
+
+    # ── Build default prompt tokens ────────────────────────────────────────
+
+    req [int] prompt_tokens():
+        [TOK_SOT, TOK_LANG_EN, TOK_TRANSCRIBE, TOK_NO_TIMESTAMPS]
+
+# ── Loader ────────────────────────────────────────────────────────────────────
+#
+# Expects two files side-by-side:
+#   <path>/vocab.json   — {"<token>": <id>, ...}  (flat JSON object, string keys, int values)
+#   <path>/merges.txt   — one merge rule per line: "A B"
+#
+# The vocab.json parser is a minimal hand-rolled parser that handles the flat
+# {"key": int, ...} structure used by Whisper (no nested objects/arrays needed).
+
+pub Tokenizer load_tokenizer(string dir) throws:
+    # ── Parse vocab.json ──────────────────────────────────────────────────────
+    let string vocab_path = "{dir}/vocab.json"
+    let string vocab_text = fs.read(vocab_path)
+
+    var {string=int} vocab   = {=}
+    var {int=string} reverse = {=}
+
+    # Minimal JSON parser for {"token": id, ...}
+    # Uses chr(34) for the double-quote character to avoid lexer confusion.
+    let string Q = chr(34)   # "
+    var int i = 0
+    let int vlen = vocab_text.length
+
+    let string BSLASH = chr(92)  # backslash
+
+    # Skip to first " (past the opening '{')
+    while i < vlen and vocab_text[i] != Q:
+        i += 1
+
+    while i < vlen:
+        # Read the key string (between quotes, with escape handling)
+        i += 1  # skip opening "
+        var string key = ""
+        while i < vlen and vocab_text[i] != Q:
+            if vocab_text[i] == BSLASH and i + 1 < vlen:
+                i += 1
+                let string esc = vocab_text[i]
+                if esc == "n":
+                    key = "{key}\n"
+                elif esc == "t":
+                    key = "{key}\t"
+                elif esc == "r":
+                    key = "{key}\r"
+                else:
+                    key = "{key}{esc}"
+            else:
+                key = "{key}{vocab_text[i]}"
+            i += 1
+        i += 1  # skip closing "
+
+        # Skip whitespace and ':'
+        while i < vlen and (vocab_text[i] == ":" or vocab_text[i] == " " or vocab_text[i] == "\t"):
+            i += 1
+
+        # Read the integer value
+        var string num_str = ""
+        while i < vlen and vocab_text[i] >= "0" and vocab_text[i] <= "9":
+            num_str = "{num_str}{vocab_text[i]}"
+            i += 1
+
+        if num_str.length > 0:
+            let int id = int(num_str)
+            vocab[key]    = id
+            reverse[id]   = key
+
+        # Advance to next " (next key or end of object)
+        while i < vlen and vocab_text[i] != Q and vocab_text[i] != "}":
+            i += 1
+        if i < vlen and vocab_text[i] == "}":
+            i = vlen  # done
+
+    # ── Parse merges.txt ─────────────────────────────────────────────────────
+    let string merges_path = "{dir}/merges.txt"
+    let [string] merge_lines = fs.readLines(merges_path)
+
+    var [[string]] merges = []
+    for line in merge_lines:
+        # Skip comment lines (start with '#') and blank lines
+        if line.length == 0 or line[0] == "#":
+            continue
+        # Find the single space separating the two BPE pieces
+        var int sp = 0
+        var bool found_sp = false
+        while sp < line.length and not found_sp:
+            if line[sp] == " ":
+                found_sp = true
+            else:
+                sp += 1
+        if found_sp:
+            let string a = line[0..sp]
+            let string b = line[(sp + 1)..line.length]
+            merges.push([a, b])
+
+    Tokenizer(vocab, reverse, merges)

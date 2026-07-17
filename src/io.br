@@ -1,0 +1,38 @@
+# Binary I/O utilities for parsing binary file formats.
+# All multi-byte values are little-endian. Byte buffers are [uint8] (real
+# 1-byte elements — see fs.readBytes), so every byte is widened to int
+# before being shifted (uint8 can't hold a value shifted left by 8+).
+
+# Read a u16 little-endian from bytes at offset.
+pub int read_u16_le([uint8] bytes, int offset):
+    int(bytes[offset]) | (int(bytes[offset + 1]) << 8)
+
+# Read a u32 little-endian from bytes at offset.
+pub int read_u32_le([uint8] bytes, int offset):
+    int(bytes[offset]) | (int(bytes[offset + 1]) << 8) | (int(bytes[offset + 2]) << 16) | (int(bytes[offset + 3]) << 24)
+
+# Read a float32 little-endian from bytes at offset.
+pub float read_f32_le([uint8] bytes, int offset):
+    let int bits = read_u32_le(bytes, offset)
+    bitsToFloat(bits)
+
+# Read n bytes as a list of bytes from bytes at offset.
+pub [uint8] read_bytes([uint8] bytes, int offset, int n):
+    var [uint8] result = []
+    var int i = 0
+    while i < n:
+        result.push(bytes[offset + i])
+        i += 1
+    result
+
+# Build a string from a list of byte values (UTF-8 code points, 0-255).
+pub string bytes_to_str([uint8] byte_values):
+    var string s = ""
+    for b in byte_values:
+        s = "{s}{chr(int(b))}"
+    s
+
+# Read a UTF-8 string of n bytes as a proper string using chr().
+pub string read_utf8([uint8] bytes, int offset, int n):
+    var [uint8] buf = read_bytes(bytes, offset, n)
+    bytes_to_str(buf)

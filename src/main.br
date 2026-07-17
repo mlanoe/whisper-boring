@@ -1,0 +1,56 @@
+# whisper-boring — CLI entry point
+#
+# Usage:
+#   boring run src/main.br <audio.wav> [--model tiny|base|small|medium]
+#                                      [--weights <path>]
+#                                      [--tokenizer <dir>]
+#
+# Defaults to weights/<model>.wbrf and weights/tokenizer — generate these with:
+#   python tools/export_weights.py --model tiny --out weights/tiny.wbrf
+
+use model
+
+ModelSize size_from_str(string s):
+    match s:
+        "tiny":   ModelSize.Tiny
+        "small":  ModelSize.Small
+        "medium": ModelSize.Medium
+        _:        ModelSize.Base
+
+def main() throws:
+    let [string] argv = args()
+
+    var string audio_path    = "test/test10s.wav"
+    var string model_name    = "tiny"
+    var string weights_path  = ""
+    var string tokenizer_dir = "weights/tokenizer"
+
+    var bool have_audio = false
+    var int i = 0
+    while i < argv.length:
+        let string a = argv[i]
+        if a == "--model" and i + 1 < argv.length:
+            model_name = argv[i + 1]
+            i += 2
+        elif a == "--weights" and i + 1 < argv.length:
+            weights_path = argv[i + 1]
+            i += 2
+        elif a == "--tokenizer" and i + 1 < argv.length:
+            tokenizer_dir = argv[i + 1]
+            i += 2
+        else:
+            if not have_audio:
+                audio_path = a
+                have_audio = true
+            i += 1
+
+    if weights_path == "":
+        weights_path = "weights/{model_name}.wbrf"
+
+    let ModelSize size = size_from_str(model_name)
+
+    print "[diag] loading weights from {weights_path}..."
+    var Whisper w   = load_whisper(weights_path, tokenizer_dir, size)
+    print "[diag] weights loaded"
+    let string text = w.transcribe(audio_path)
+    print text

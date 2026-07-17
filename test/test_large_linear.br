@@ -1,0 +1,55 @@
+# Isolates whether LinearKernel is correct when the output needs MORE THAN
+# ONE workgroup (blocks > 1) — every prior test only ever exercised blocks=1
+# (small synthetic dims), but the real vocab projection (n_vocab=51865) needs
+# blocks=203, which the decoder-level test never covered.
+use io
+use math
+use math_gpu
+
+let int D_IN  = 384
+let int D_OUT = 51865
+
+pub req [float] mk(int n, float scale, float bias):
+    var [float] out = []
+    for i in 0..n:
+        out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
+    out
+
+def main() throws:
+    print "=== large linear_gpu (blocks > 1) correctness ==="
+
+    let [float] x = mk(D_IN, 0.3, 0.1)
+    let [float] w = mk(D_IN * D_OUT, 0.2, 0.1)
+    let [float] b = mk(D_OUT, 0.1, 0.05)
+
+    let [float] w_t = transpose_flat(w, D_OUT, D_IN)
+    let [float] gpu_out = linear_gpu(x, w_t, b, 1, D_IN, D_OUT)
+
+    # CPU reference: plain matmul (row-major w: D_OUT x D_IN, matching linear_gpu's
+    # convention used throughout math_gpu.br/math.br).
+    var [float] cpu_out = []
+    for o in 0..D_OUT:
+        var float acc = b[o]
+        for i in 0..D_IN:
+            acc += x[i] * w[o * D_IN + i]
+        cpu_out.push(acc)
+
+    var float max_diff = 0.0
+    var int worst = 0
+    var int o = 0
+    while o < D_OUT:
+        let dd = if cpu_out[o] > gpu_out[o]: cpu_out[o] - gpu_out[o] else: gpu_out[o] - cpu_out[o]
+        if dd > max_diff:
+            max_diff = dd
+            worst = o
+        o += 1
+
+    print "gpu_out[0]={gpu_out[0]:.6f} cpu_out[0]={cpu_out[0]:.6f}"
+    print "gpu_out[57]={gpu_out[57]:.6f} cpu_out[57]={cpu_out[57]:.6f}"
+    print "gpu_out[300]={gpu_out[300]:.6f} cpu_out[300]={cpu_out[300]:.6f}"
+    print "gpu_out[1000]={gpu_out[1000]:.6f} cpu_out[1000]={cpu_out[1000]:.6f}"
+    print "gpu_out[25000]={gpu_out[25000]:.6f} cpu_out[25000]={cpu_out[25000]:.6f}"
+    print "gpu_out[49999]={gpu_out[49999]:.6f} cpu_out[49999]={cpu_out[49999]:.6f}"
+    print "gpu_out[51000]={gpu_out[51000]:.6f} cpu_out[51000]={cpu_out[51000]:.6f}"
+    print "gpu_out[51864]={gpu_out[51864]:.6f} cpu_out[51864]={cpu_out[51864]:.6f}"
+    print "max diff = {max_diff:.8f} at index {worst}"

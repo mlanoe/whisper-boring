@@ -1,0 +1,16 @@
+/target
+/weights
+examples/*/target/
+examples/*_rust/
+examples/*_cuda/
+examples/*_metal/
+examples/*_wgpu/
+# Generated `boring build --target ...` projects anywhere in the repo
+# (src/, test/, etc) — fully regeneratable from the .br source.
+*_rust/
+*_cuda/
+*_metal/
+*_wgpu/
+/wgpu_test/
+Cargo.lock
+.claude/worktrees/

@@ -1,0 +1,269 @@
+# src/math.br â€” linear algebra primitives
+
+let float PI = 3.141592653589793
+
+# â”€â”€ Utilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub req [float] zeros(int n):
+    var [float] out = []
+    for _ in 0..n:
+        out.push(0.0)
+    out
+
+pub req [float] vec_add([float] a, [float] b):
+    var [float] out = []
+    for i in 0..a.length:
+        out.push(a[i] + b[i])
+    out
+
+pub req [float] vec_scale([float] a, float s):
+    a |> map((v): v * s)
+
+# Flat-matrix transpose: src is (rows × cols) row-major, returns (cols × rows).
+# Used to pre-transpose static weight matrices once at model-load time (see
+# model.br's load_whisper) rather than on every linear_gpu call — see
+# math_gpu.br's LinearKernel doc comment for why the GPU-side kernel needs its
+# second operand laid out this way (memory-coalescing).
+pub req [float] transpose_flat([float] src, int rows, int cols):
+    var [float] dst = [0.0 for ..rows * cols]
+    for i in 0..rows:
+        for j in 0..cols:
+            dst[j * rows + i] = src[i * cols + j]
+    dst
+
+# â”€â”€ Complex numbers (for FFT) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub struct Complex:
+    float re
+    float im
+
+    req Complex add(Complex b):
+        Complex(re=self.re + b.re, im=self.im + b.im)
+
+    req Complex sub(Complex b):
+        Complex(re=self.re - b.re, im=self.im - b.im)
+
+    req Complex mul(Complex b):
+        Complex(
+            re = self.re * b.re - self.im * b.im,
+            im = self.re * b.im + self.im * b.re
+        )
+
+    req float mag():
+        (self.re * self.re + self.im * self.im).sqrt()
+
+pub int next_pow2(int n):
+    var int p = 1
+    while p < n: p *= 2
+    p
+
+pub int ilog2(int n):
+    var int k = 0
+    var int m = n
+    while m > 1:
+        m /= 2
+        k += 1
+    k
+
+# Windowed STFT frame â†’ magnitude spectrum (iterative Cooley-Tukey).
+# Reads audio[start..start+n_fft], multiplies by win, then runs an in-place
+# radix-2 FFT on flat float arrays (no Complex struct, no recursion).
+# n_fft MUST be a power of 2.  Returns n_fft/2+1 one-sided magnitudes.
+pub req [float] rfft_windowed([float] audio, int start, [float] win, int n_fft) throws:
+    # Direct O(n_fft^2) DFT via a precomputed one-period twiddle table, indexed
+    # by (k*i) % n_fft. Works for any n_fft (Whisper uses n_fft=400, not a
+    # power of 2), unlike the radix-2 Cooley-Tukey FFT this replaces.
+    var [float] x = []
+    for i in 0..n_fft:
+        let float sample = if start + i < audio.length: audio[start + i] else: 0.0
+        x.push(sample * win[i])
+
+    var [float] cos_tab = []
+    var [float] sin_tab = []
+    for i in 0..n_fft:
+        let float ang = -2.0 * PI * float(i) / float(n_fft)
+        cos_tab.push(ang.cos())
+        sin_tab.push(ang.sin())
+
+    let int n_out = n_fft / 2 + 1
+    var [float] mag = []
+    for k in 0..n_out:
+        var float re = 0.0
+        var float im = 0.0
+        for i in 0..n_fft:
+            let int idx = (k * i) % n_fft
+            re += x[i] * cos_tab[idx]
+            im += x[i] * sin_tab[idx]
+        mag.push((re * re + im * im).sqrt())
+    mag
+
+# Convenience wrapper: takes a samples slice directly (unit window).
+pub req [float] rfft_flat([float] samples, int n_fft) throws:
+    var [float] unit_win = []
+    for _ in 0..n_fft:
+        unit_win.push(1.0)
+    rfft_windowed(samples, 0, unit_win, n_fft)
+
+# â”€â”€ Activation functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub req float gelu_f(float x):
+    0.5 * x * (1.0 + (0.7978845608 * (x + 0.044715 * x * x * x)).tanh())
+
+pub req [float] gelu([float] x):
+    x |> map((v): gelu_f(v))
+
+# â”€â”€ Normalization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+pub req [float] softmax([float] x):
+    var float mx = x[0]
+    for v in x:
+        if v > mx: mx = v
+    var [float] e = x |> map((v): (v - mx).exp())
+    let float   s = e |> sum()
+    e |> map((v): v / s)
+
+# Normalize a single vector of length d.
+pub req [float] layer_norm([float] x, [float] w, [float] b):
+    let int n    = x.length
+    let float mu = (x |> sum()) / float(n)
+    var float v  = 0.0
+    for xi in x: v += (xi - mu) * (xi - mu)
+    v /= float(n)
+    let float sd = (v + 1e-5).sqrt()
+    var [float] out = []
+    for i in 0..n:
+        out.push(w[i] * (x[i] - mu) / sd + b[i])
+    out
+
+# Apply layer_norm to every row of a (seq Ã— d) matrix.
+pub req [float] layer_norm_seq([float] x, [float] w, [float] b, int seq, int d):
+    var [float] out = []
+    for i in 0..seq:
+        # Parens around both range bounds are load-bearing: the boring transpiler
+        # currently binds `..` tighter than `*` inside an index expression, so the
+        # unparenthesized form transpiles to `i * (d..(i+1)) * d` instead of the
+        # intended `(i*d)..((i+1)*d)`.
+        let [float] row    = x[(i * d)..((i + 1) * d)]
+        let [float] normed = layer_norm(row, w, b)
+        for v in normed: out.push(v)
+    out
+
+# â”€â”€ Matrix operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+# A (mÃ—k) Â· B (kÃ—n) â†’ C (mÃ—n), all row-major flat.
+pub req [float] matmul([float] a, [float] b, int m, int k, int n):
+    var [float] c = []
+    for i in 0..m:
+        for j in 0..n:
+            var float s = 0.0
+            for p in 0..k:
+                s += a[i * k + p] * b[p * n + j]
+            c.push(s)
+    c
+
+# A (mÃ—k) Â· B^T (nÃ—k) â†’ C (mÃ—n).
+pub req [float] matmul_bt([float] a, [float] b, int m, int k, int n):
+    var [float] c = []
+    for i in 0..m:
+        for j in 0..n:
+            var float s = 0.0
+            for p in 0..k:
+                s += a[i * k + p] * b[j * k + p]
+            c.push(s)
+    c
+
+# Linear layer: y = x W^T + b.
+# x: (seq Ã— d_in), W: (d_out Ã— d_in), b: (d_out,) â†’ y: (seq Ã— d_out).
+pub req [float] linear([float] x, [float] w, [float] bv, int seq, int d_in, int d_out):
+    var [float] out = []
+    for i in 0..seq:
+        for j in 0..d_out:
+            var float s = bv[j]
+            for p in 0..d_in:
+                s += x[i * d_in + p] * w[j * d_in + p]
+            out.push(s)
+    out
+
+# Conv1d with same-padding and stride 1.
+# x: (T Ã— C_in), w: (C_out Ã— C_in Ã— K), b: (C_out,) â†’ out: (T Ã— C_out).
+pub req [float] conv1d([float] x, [float] w, [float] bv,
+                   int t, int c_in, int c_out, int k):
+    let int pad = k / 2
+    var [float] out = []
+    for i in 0..t:
+        for oc in 0..c_out:
+            var float s = bv[oc]
+            for ic in 0..c_in:
+                for ki in 0..k:
+                    let int src = i + ki - pad
+                    if src >= 0 and src < t:
+                        s += x[src * c_in + ic] * w[oc * c_in * k + ic * k + ki]
+            out.push(s)
+    out
+
+# â”€â”€ Attention â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+# Scaled dot-product attention.
+# q: (seq_q Ã— d_k), k: (seq_k Ã— d_k), v: (seq_k Ã— d_v) â†’ (seq_q Ã— d_v).
+# Pass causal=true to apply a causal (upper-triangular) mask.
+pub req [float] attention([float] q, [float] k, [float] v,
+                      int seq_q, int seq_k, int d_k, int d_v,
+                      bool causal):
+    let float scale = float(d_k).sqrt()
+    var [float] scores = matmul_bt(q, k, seq_q, d_k, seq_k)
+
+    for i in 0..seq_q:
+        for j in 0..seq_k:
+            var float s = scores[i * seq_k + j] / scale
+            if causal and j > i: s = -1e9
+            scores[i * seq_k + j] = s
+
+    var [float] weights = []
+    for i in 0..seq_q:
+        let [float] row = scores[(i * seq_k)..((i + 1) * seq_k)]
+        let [float] p   = softmax(row)
+        for w2 in p: weights.push(w2)
+
+    matmul(weights, v, seq_q, seq_k, d_v)
+
+# Multi-head attention.
+# x_q:  (seq_q Ã— d), x_kv: (seq_k Ã— d)
+# w_{q,k,v}: (d Ã— d), b_{q,k,v}: (d,)
+# w_o: (d Ã— d), b_o: (d,)
+pub req [float] mha([float] x_q,  [float] x_kv,
+                [float] w_q,  [float] b_q,
+                [float] w_k,  [float] b_k,
+                [float] w_v,  [float] b_v,
+                [float] w_o,  [float] b_o,
+                int seq_q, int seq_k, int d, int n_head,
+                bool causal):
+    let int d_head = d / n_head
+
+    let [float] Q = linear(x_q,  w_q, b_q, seq_q, d, d)
+    let [float] K = linear(x_kv, w_k, b_k, seq_k, d, d)
+    let [float] V = linear(x_kv, w_v, b_v, seq_k, d, d)
+
+    var [float] concat = zeros(seq_q * d)
+
+    for h in 0..n_head:
+        let int off = h * d_head
+
+        var [float] Qh = []
+        var [float] Kh = []
+        var [float] Vh = []
+        for i in 0..seq_q:
+            for j in 0..d_head:
+                Qh.push(Q[i * d + off + j])
+        for i in 0..seq_k:
+            for j in 0..d_head:
+                Kh.push(K[i * d + off + j])
+                Vh.push(V[i * d + off + j])
+
+        let [float] head = attention(Qh, Kh, Vh, seq_q, seq_k, d_head, d_head, causal)
+
+        for i in 0..seq_q:
+            for j in 0..d_head:
+                concat[i * d + off + j] = head[i * d_head + j]
+
+    linear(concat, w_o, b_o, seq_q, d, d)
+

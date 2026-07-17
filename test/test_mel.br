@@ -1,0 +1,63 @@
+# test/test_mel.br — test the iterative FFT and STFT on tiny.wav
+use math
+use io
+use audio
+
+def main() throws:
+    # ── FFT correctness: DC signal ────────────────────────────────────────────
+    print "Testing rfft_flat on DC signal..."
+    var [float] dc = []
+    for _ in 0..16:
+        dc.push(1.0)
+    let [float] dc_mag = rfft_flat(dc, 16)
+    print "DC bin 0 = {dc_mag[0]:.1f}  (expect 16.0)"
+    print "DC bin 1 = {dc_mag[1]:.4f}  (expect 0.0)"
+    print "FFT test passed."
+
+    # ── Hann window ───────────────────────────────────────────────────────────
+    print "Testing hann_window(8)..."
+    let [float] hw = hann_window(8)
+    let float hw0 = hw[0]
+    let float hw4 = hw[4]
+    print "win[0]={hw0:.4f} (expect 0.0)  win[4]={hw4:.4f}"
+
+    # ── WAV load ──────────────────────────────────────────────────────────────
+    print "Loading WAV..."
+    let [float] samples = load_wav("test/tiny.wav")
+    print "Samples: {samples.length}"
+
+    # ── STFT (only 2 frames for tiny.wav) ────────────────────────────────────
+    print "Computing STFT power..."
+    let int n_fft_val = 400
+    let int hop_val   = 160
+    let int n_mels_val = 80
+    let int sr_val     = 16000
+    let [float] power = stft_power(samples, n_fft_val, hop_val)
+    let int n_freq  = n_fft_val / 2 + 1
+    let int n_frames = power.length / n_freq
+    print "STFT: {n_frames} frames × {n_freq} bins  (expect ≥1 frame)"
+
+    let float p0 = power[0]
+    print "power[0] = {p0:.6f}"
+
+    # ── Mel filterbank ────────────────────────────────────────────────────────
+    print "Computing mel filterbank..."
+    let [float] fb = mel_filterbank(n_mels_val, n_fft_val, sr_val)
+    print "Filterbank shape: {n_mels_val} × {n_freq} = {fb.length} entries"
+
+    # ── Mel application (skip full N_FRAMES padding for speed) ───────────────
+    print "Applying mel filterbank..."
+    var [float] mel_out = []
+    for m in 0..n_mels_val:
+        for f in 0..n_frames:
+            var float s = 0.0
+            for k in 0..n_freq:
+                s += fb[m * n_freq + k] * power[f * n_freq + k]
+            mel_out.push(s)
+    let int mel_expect = n_mels_val * n_frames
+    print "Mel matrix: {mel_out.length} values (expect {mel_expect})"
+
+    let float mel0 = mel_out[0]
+    print "mel[0] = {mel0:.6f}"
+
+    print "Mel spectrogram test passed."

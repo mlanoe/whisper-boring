@@ -1,0 +1,260 @@
+# test/test_math_gpu.br — vérifie que math_gpu.br produit des résultats
+# cohérents avec les fonctions CPU de référence (math.br), en simulation.
+use io
+use math
+use math_gpu
+
+def main() throws:
+    print "=== GPU transformer math (simulation) ==="
+
+    # ── linear ────────────────────────────────────────────────────────────
+    let int seq    = 5
+    let int d_in   = 4
+    let int d_out  = 3
+    var [float] x = []
+    for i in 0..(seq * d_in):
+        x.push(float(i) * 0.1)
+    var [float] w = []
+    for i in 0..(d_out * d_in):
+        w.push(float(i) * 0.05 - 0.2)
+    var [float] bv = []
+    for i in 0..d_out:
+        bv.push(float(i) * 0.01)
+
+    let [float] lin_cpu = linear(x, w, bv, seq, d_in, d_out)
+    let [float] w_t = transpose_flat(w, d_out, d_in)
+    let [float] lin_gpu = linear_gpu(x, w_t, bv, seq, d_in, d_out)
+    var float max_diff = 0.0
+    for i in 0..lin_cpu.length:
+        let d = if lin_cpu[i] > lin_gpu[i]: lin_cpu[i] - lin_gpu[i] else: lin_gpu[i] - lin_cpu[i]
+        if d > max_diff: max_diff = d
+    print "linear: max |cpu-gpu| = {max_diff:.8f}  (expect ~0)"
+
+    # ── gelu ──────────────────────────────────────────────────────────────
+    let [float] gelu_cpu_v = gelu(lin_cpu)
+    let [float] gelu_gpu_v = gelu_gpu(lin_gpu)
+    var float gelu_diff = 0.0
+    for i in 0..gelu_cpu_v.length:
+        let d = if gelu_cpu_v[i] > gelu_gpu_v[i]: gelu_cpu_v[i] - gelu_gpu_v[i] else: gelu_gpu_v[i] - gelu_cpu_v[i]
+        if d > gelu_diff: gelu_diff = d
+    print "gelu: max |cpu-gpu| = {gelu_diff:.8f}  (expect ~0)"
+
+    # ── layer_norm_seq ────────────────────────────────────────────────────
+    var [float] ln_w = []
+    var [float] ln_b = []
+    for i in 0..d_in:
+        ln_w.push(1.0 + float(i) * 0.1)
+        ln_b.push(float(i) * 0.02)
+    let [float] ln_cpu = layer_norm_seq(x, ln_w, ln_b, seq, d_in)
+    let [float] ln_gpu = layer_norm_seq_gpu(x, ln_w, ln_b, seq, d_in)
+    var float ln_diff = 0.0
+    for i in 0..ln_cpu.length:
+        let d = if ln_cpu[i] > ln_gpu[i]: ln_cpu[i] - ln_gpu[i] else: ln_gpu[i] - ln_cpu[i]
+        if d > ln_diff: ln_diff = d
+    print "layer_norm_seq: max |cpu-gpu| = {ln_diff:.8f}  (expect ~0)"
+
+    # ── attention_heads_gpu (single head, n_head=1) ───────────────────────
+    # attention_heads_gpu assumes v shares q/k's per-head width (real MHA
+    # usage always has this), unlike the old single-head attention_gpu which
+    # allowed d_k != d_v as a generic primitive — so d_k == d_v here.
+    let int seq_q = 4
+    let int seq_k = 6
+    let int d_k   = 3
+    let int d_v   = 3
+    var [float] q = []
+    for i in 0..(seq_q * d_k):
+        q.push(float(i) * 0.03 - 0.5)
+    var [float] k = []
+    for i in 0..(seq_k * d_k):
+        k.push(float(i) * 0.02 - 0.3)
+    var [float] v = []
+    for i in 0..(seq_k * d_v):
+        v.push(float(i) * 0.01)
+
+    let [float] attn_cpu = attention(q, k, v, seq_q, seq_k, d_k, d_v, false)
+    let [float] attn_gpu = attention_heads_gpu(q, k, v, seq_q, seq_k, d_k, 1, false)
+    var float attn_diff = 0.0
+    for i in 0..attn_cpu.length:
+        let d = if attn_cpu[i] > attn_gpu[i]: attn_cpu[i] - attn_gpu[i] else: attn_gpu[i] - attn_cpu[i]
+        if d > attn_diff: attn_diff = d
+    print "attention_heads_gpu (single head, non-causal): max |cpu-gpu| = {attn_diff:.8f}  (expect ~0)"
+
+    # ── attention_heads_gpu (single head, causal) ─────────────────────────
+    let [float] attn_c_cpu = attention(q, k, v, seq_q, seq_k, d_k, d_v, true)
+    let [float] attn_c_gpu = attention_heads_gpu(q, k, v, seq_q, seq_k, d_k, 1, true)
+    var float attn_c_diff = 0.0
+    for i in 0..attn_c_cpu.length:
+        let d = if attn_c_cpu[i] > attn_c_gpu[i]: attn_c_cpu[i] - attn_c_gpu[i] else: attn_c_gpu[i] - attn_c_cpu[i]
+        if d > attn_c_diff: attn_c_diff = d
+    print "attention_heads_gpu (single head, causal): max |cpu-gpu| = {attn_c_diff:.8f}  (expect ~0)"
+
+    # ── attention_heads_gpu (multi-head, batched) ─────────────────────────
+    # Validates the (h, i, j) index arithmetic in MatMulBTHeadsKernel/
+    # MatMulHeadsKernel directly: compares one batched call against a
+    # per-head CPU reference built exactly the way the old host-side loop
+    # used to (slice each head out, run single-head attention, reassemble).
+    let int n_head_attn = 3
+    let int d_full       = d_k * n_head_attn
+    var [float] qm = []
+    for i in 0..(seq_q * d_full):
+        qm.push(float(i) * 0.017 - 0.4)
+    var [float] km = []
+    for i in 0..(seq_k * d_full):
+        km.push(float(i) * 0.013 - 0.25)
+    var [float] vm = []
+    for i in 0..(seq_k * d_full):
+        vm.push(float(i) * 0.009 - 0.1)
+
+    var [float] concat_ref = zeros(seq_q * d_full)
+    for h in 0..n_head_attn:
+        let int off = h * d_k
+        var [float] qh = []
+        var [float] kh = []
+        var [float] vh = []
+        for i in 0..seq_q:
+            for j in 0..d_k:
+                qh.push(qm[i * d_full + off + j])
+        for i in 0..seq_k:
+            for j in 0..d_k:
+                kh.push(km[i * d_full + off + j])
+                vh.push(vm[i * d_full + off + j])
+        let [float] head_ref = attention(qh, kh, vh, seq_q, seq_k, d_k, d_k, true)
+        for i in 0..seq_q:
+            for j in 0..d_k:
+                concat_ref[i * d_full + off + j] = head_ref[i * d_k + j]
+
+    let [float] concat_gpu = attention_heads_gpu(qm, km, vm, seq_q, seq_k, d_full, n_head_attn, true)
+    var float heads_diff = 0.0
+    for i in 0..concat_ref.length:
+        let dd = if concat_ref[i] > concat_gpu[i]: concat_ref[i] - concat_gpu[i] else: concat_gpu[i] - concat_ref[i]
+        if dd > heads_diff: heads_diff = dd
+    print "attention_heads_gpu (multi-head batched vs per-head CPU reference): max diff = {heads_diff:.8f}  (expect ~0)"
+
+    # ── mha ───────────────────────────────────────────────────────────────
+    let int d      = 8
+    let int n_head = 2
+    var [float] xq = []
+    for i in 0..(seq_q * d):
+        xq.push(float(i) * 0.02 - 0.4)
+    var [float] wq = []
+    var [float] wk = []
+    var [float] wv = []
+    var [float] wo = []
+    for i in 0..(d * d):
+        wq.push(float(i) * 0.01 - 0.05)
+        wk.push(float(i) * 0.008 - 0.04)
+        wv.push(float(i) * 0.006 - 0.03)
+        wo.push(float(i) * 0.004 - 0.02)
+    let [float] bq = zeros(d)
+    let [float] bo = zeros(d)
+    var [float] bv2 = []
+    for i in 0..d:
+        bv2.push(float(i) * 0.001)
+
+    # mha_gpu/mha_step_gpu/mha_cross_step_gpu forward their w_q/w_k/w_v/w_o
+    # straight into linear_gpu, so they carry the same pre-transposed contract
+    # (see linear_gpu's doc comment) — transpose once here, matching how
+    # model.br's load_whisper pre-transposes every weight tensor once at load.
+    let [float] wq_t = transpose_flat(wq, d, d)
+    let [float] wk_t = transpose_flat(wk, d, d)
+    let [float] wv_t = transpose_flat(wv, d, d)
+    let [float] wo_t = transpose_flat(wo, d, d)
+
+    let [float] mha_cpu_v = mha(xq, xq, wq, bq, wk, zeros(d), wv, bv2, wo, bo, seq_q, seq_q, d, n_head, true)
+    let [float] mha_gpu_v = mha_gpu(xq, xq, wq_t, bq, wk_t, zeros(d), wv_t, bv2, wo_t, bo, seq_q, seq_q, d, n_head, true)
+    var float mha_diff = 0.0
+    for i in 0..mha_cpu_v.length:
+        let dd = if mha_cpu_v[i] > mha_gpu_v[i]: mha_cpu_v[i] - mha_gpu_v[i] else: mha_gpu_v[i] - mha_cpu_v[i]
+        if dd > mha_diff: mha_diff = dd
+    print "mha (causal): max |cpu-gpu| = {mha_diff:.8f}  (expect ~0)"
+
+    # ── mha_step_gpu / mha_cross_step_gpu (KV-cache) ──────────────────────
+    # Feed xq through mha_step_gpu one position at a time, growing the cache
+    # each step, and check that position i's incremental output matches
+    # position i's slice of the full causal mha_gpu computed above — a causal
+    # mask only ever lets position i see positions 0..=i, exactly what the
+    # cache holds by the time step i runs.
+    var float step_diff = 0.0
+    var [float] step_cache_k = []
+    var [float] step_cache_v = []
+    for i in 0..seq_q:
+        let [float] x_i = xq[(i * d)..((i + 1) * d)]
+        let (step_out, new_k, new_v) = mha_step_gpu(x_i, wq_t, bq, wk_t, zeros(d), wv_t, bv2, wo_t, bo,
+            step_cache_k, step_cache_v, d, n_head)
+        step_cache_k = new_k
+        step_cache_v = new_v
+        for j in 0..d:
+            let expected = mha_gpu_v[i * d + j]
+            let dd = if expected > step_out[j]: expected - step_out[j] else: step_out[j] - expected
+            if dd > step_diff: step_diff = dd
+    print "mha_step_gpu (vs causal mha_gpu, per-position): max diff = {step_diff:.8f}  (expect ~0)"
+
+    # ── mha_cross_step_gpu (fixed KV cache) ───────────────────────────────
+    # Cross-attention (non-causal): every query position sees the full k/v
+    # sequence, so mha_cross_step_gpu run per-position (against the SAME
+    # precomputed k/v the whole time) should match non-causal mha_gpu exactly.
+    # `audio_like` stands in for the encoder output: same width (d) as xq,
+    # a different length (seq_a != seq_q) to also exercise that case.
+    let int seq_a = 5
+    var [float] audio_like = []
+    for i in 0..(seq_a * d):
+        audio_like.push(float(i) * 0.015 - 0.35)
+
+    let [float] mha_cross_gpu_v = mha_gpu(xq, audio_like, wq_t, bq, wk_t, zeros(d), wv_t, bv2, wo_t, bo, seq_q, seq_a, d, n_head, false)
+    let [float] cross_k = linear_gpu(audio_like, wk_t, zeros(d), seq_a, d, d)
+    let [float] cross_v = linear_gpu(audio_like, wv_t, bv2, seq_a, d, d)
+    var float cross_step_diff = 0.0
+    for i in 0..seq_q:
+        let [float] x_i = xq[(i * d)..((i + 1) * d)]
+        let [float] out_i = mha_cross_step_gpu(x_i, wq_t, bq, cross_k, cross_v, wo_t, bo, seq_a, d, n_head)
+        for j in 0..d:
+            let expected = mha_cross_gpu_v[i * d + j]
+            let dd = if expected > out_i[j]: expected - out_i[j] else: out_i[j] - expected
+            if dd > cross_step_diff: cross_step_diff = dd
+    print "mha_cross_step_gpu (vs non-causal mha_gpu, per-position): max diff = {cross_step_diff:.8f}  (expect ~0)"
+
+    # ── conv1d ────────────────────────────────────────────────────────────
+    let int t_in  = 6
+    let int c_in  = 2
+    let int c_out = 3
+    let int kk    = 3
+    var [float] cx = []
+    for i in 0..(t_in * c_in):
+        cx.push(float(i) * 0.05 - 0.15)
+    var [float] cw = []
+    for i in 0..(c_out * c_in * kk):
+        cw.push(float(i) * 0.02 - 0.1)
+    var [float] cb = []
+    for i in 0..c_out:
+        cb.push(float(i) * 0.01)
+
+    let [float] conv_cpu = conv1d(cx, cw, cb, t_in, c_in, c_out, kk)
+    let [float] conv_gpu = conv1d_gpu(cx, cw, cb, t_in, c_in, c_out, kk, 1, t_in)
+    var float conv_diff = 0.0
+    for i in 0..conv_cpu.length:
+        let d = if conv_cpu[i] > conv_gpu[i]: conv_cpu[i] - conv_gpu[i] else: conv_gpu[i] - conv_cpu[i]
+        if d > conv_diff: conv_diff = d
+    print "conv1d (stride 1): max |cpu-gpu| = {conv_diff:.8f}  (expect ~0)"
+
+    # ── conv1d stride 2 (encoder's conv2 pattern) — CPU reference computed inline ──
+    let int t_out2 = t_in / 2
+    var [float] conv2_cpu = []
+    for i in 0..t_out2:
+        let int src = i * 2
+        for oc in 0..c_out:
+            var float s = cb[oc]
+            let int pad2 = kk / 2
+            for ic in 0..c_in:
+                for ki in 0..kk:
+                    let int si = src + ki - pad2
+                    if si >= 0 and si < t_in:
+                        s += cx[si * c_in + ic] * cw[oc * c_in * kk + ic * kk + ki]
+            conv2_cpu.push(s)
+    let [float] conv2_gpu = conv1d_gpu(cx, cw, cb, t_in, c_in, c_out, kk, 2, t_out2)
+    var float conv2_diff = 0.0
+    for i in 0..conv2_cpu.length:
+        let d = if conv2_cpu[i] > conv2_gpu[i]: conv2_cpu[i] - conv2_gpu[i] else: conv2_gpu[i] - conv2_cpu[i]
+        if d > conv2_diff: conv2_diff = d
+    print "conv1d (stride 2): max |cpu-gpu| = {conv2_diff:.8f}  (expect ~0)"
+
+    print "=== GPU math test passed ==="

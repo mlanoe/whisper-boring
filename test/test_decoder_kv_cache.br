@@ -1,0 +1,107 @@
+# test/test_decoder_kv_cache.br — verifies that TextDecoder.forward_step_all
+# (the new KV-cache path) produces, at every position, the same logits as
+# reprocessing the whole sequence from scratch with the old
+# DecoderBlock.forward/TextDecoder.forward path, on a small synthetic model.
+#
+# Deliberately bypasses generate() (and its real TOK_SOT/TOK_EOT/... constants,
+# which would force an unwieldy ~50k-row vocab table just to stay in bounds —
+# irrelevant to what's actually being checked here: does the incremental
+# per-position computation match full reprocessing). A small, arbitrary token
+# sequence exercises the identical underlying mechanism.
+use io
+use math
+use math_gpu
+use tokenizer
+use decoder
+
+let int D       = 8
+let int N_HEAD  = 2
+let int N_VOCAB = 15
+
+pub req [float] mk(int n, float scale, float bias):
+    var [float] out = []
+    for i in 0..n:
+        out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
+    out
+
+pub req DecoderBlock mk_block():
+    DecoderBlock(
+        sa_q_w = mk(D * D, 0.2, 0.1),  sa_q_b = mk(D, 0.1, 0.05),
+        sa_k_w = mk(D * D, 0.2, 0.1),
+        sa_v_w = mk(D * D, 0.2, 0.1),  sa_v_b = mk(D, 0.1, 0.05),
+        sa_o_w = mk(D * D, 0.2, 0.1),  sa_o_b = mk(D, 0.1, 0.05),
+        ln1_w  = mk(D, 0.05, -1.0),    ln1_b  = mk(D, 0.05, 0.0),
+        ca_q_w = mk(D * D, 0.2, 0.1),  ca_q_b = mk(D, 0.1, 0.05),
+        ca_k_w = mk(D * D, 0.2, 0.1),
+        ca_v_w = mk(D * D, 0.2, 0.1),  ca_v_b = mk(D, 0.1, 0.05),
+        ca_o_w = mk(D * D, 0.2, 0.1),  ca_o_b = mk(D, 0.1, 0.05),
+        ln2_w  = mk(D, 0.05, -1.0),    ln2_b  = mk(D, 0.05, 0.0),
+        mlp_fc_w = mk(D * 4 * D, 0.1, 0.05), mlp_fc_b = mk(D * 4, 0.05, 0.02),
+        mlp_pr_w = mk(D * D * 4, 0.1, 0.05), mlp_pr_b = mk(D, 0.05, 0.02),
+        ln3_w  = mk(D, 0.05, -1.0),    ln3_b  = mk(D, 0.05, 0.0),
+        # Explicit defaults: `boring build` currently drops struct fields that
+        # rely on their declared default when omitted from a labeled
+        # constructor call (produces an invalid Rust struct literal missing
+        # fields) — `boring run` handles it fine. Worked around here at the
+        # source level; see session notes for the compiler-side fix needed.
+        cache_sa_k = [], cache_sa_v = [],
+        cache_ca_k = [], cache_ca_v = [],
+        ca_cached  = false
+    )
+
+def main() throws:
+    print "=== decoder KV-cache correctness ==="
+
+    let int seq_a = 5
+    # Arbitrary token ids (all < N_VOCAB) standing in for a generated sequence —
+    # correctness of forward_step_all doesn't depend on what tokens/positions
+    # mean semantically, only on matching full reprocessing at each position.
+    let [int] seq_tokens = [3, 7, 1, 9, 4, 2]
+
+    # `mk` is a pure function of (n, scale, bias) — calling it again with the
+    # same arguments reproduces byte-identical weights, so dec_ref/dec_kv get
+    # matching models without sharing a single array between two separate
+    # constructor calls (the transpiler doesn't auto-clone a struct-literal
+    # field value reused across two distinct struct instances).
+    # tok_emb_t is the weight-tied LM-head projection's pre-transposed copy
+    # (see decoder.br's TextDecoder doc comment) — model.br's load_whisper
+    # builds it via transpose_flat; built the same way here for both models.
+    var TextDecoder dec_ref = TextDecoder(
+        tok_emb = mk(N_VOCAB * D, 0.3, 0.15), tok_emb_t = transpose_flat(mk(N_VOCAB * D, 0.3, 0.15), N_VOCAB, D),
+        pos_emb = mk(448 * D, 0.2, 0.1),
+        blocks = [mk_block(), mk_block()],
+        ln_w = mk(D, 0.05, -1.0), ln_b = mk(D, 0.05, 0.0), n_head_val = N_HEAD)
+    var TextDecoder dec_kv = TextDecoder(
+        tok_emb = mk(N_VOCAB * D, 0.3, 0.15), tok_emb_t = transpose_flat(mk(N_VOCAB * D, 0.3, 0.15), N_VOCAB, D),
+        pos_emb = mk(448 * D, 0.2, 0.1),
+        blocks = [mk_block(), mk_block()],
+        ln_w = mk(D, 0.05, -1.0), ln_b = mk(D, 0.05, 0.0), n_head_val = N_HEAD)
+
+    let [float] audio = mk(seq_a * D, 0.4, 0.2)
+
+    var float max_diff = 0.0
+    var [int] tokens_so_far = []
+    var int pos = 0
+    while pos < seq_tokens.length:
+        tokens_so_far.push(seq_tokens[pos])
+
+        # Reference: full reprocessing of tokens_so_far from scratch.
+        let [float] logits_ref = dec_ref.forward(tokens_so_far, audio, seq_a)
+
+        # KV-cache: one incremental step, mutating dec_kv's block caches.
+        let [float] logits_kv = dec_kv.forward_step_all(seq_tokens[pos], pos, audio, seq_a)
+
+        guard logits_ref.length == logits_kv.length else throw "logits length mismatch at pos {pos}"
+        var int v = 0
+        while v < logits_ref.length:
+            let dd = if logits_ref[v] > logits_kv[v]: logits_ref[v] - logits_kv[v] else: logits_kv[v] - logits_ref[v]
+            if dd > max_diff: max_diff = dd
+            v += 1
+
+        print "pos {pos}: max |ref-kv| so far = {max_diff:.8f}"
+        pos += 1
+
+    print "final max diff = {max_diff:.8f}  (expect ~0)"
+    guard max_diff < 1e-6 else throw "KV-cache path diverged from reference (max diff {max_diff})"
+
+    print "=== decoder KV-cache test passed ==="

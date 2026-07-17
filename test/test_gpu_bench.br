@@ -1,0 +1,53 @@
+# test/test_gpu_bench.br — benchmark GPU vs CPU sur fichier audio long
+use io
+use math
+use audio
+use audio_gpu
+
+def main() throws:
+    let [float] samples = load_wav("test/test10s.wav")
+    print "Audio: {samples.length} samples ({samples.length / 16000} s)"
+
+    let int n_audio = samples.length
+    let int pad     = 200
+    var [float] padded = []
+    for i in 0..pad:
+        let int src = pad - i
+        padded.push(if src < n_audio: samples[src] else: 0.0)
+    for v in samples: padded.push(v)
+    for i in 0..pad:
+        let int src = n_audio - 2 - i
+        padded.push(if src >= 0 and src < n_audio: samples[src] else: 0.0)
+
+    let int n_padded  = padded.length
+    let int n_frames  = (n_padded - 400) / 160
+    let int n_freq    = 201
+    let int n_mels    = 80
+    print "STFT frames: {n_frames}  (mel cells: {n_mels * n_frames})"
+
+    let [float] win = hann_window(400)
+    let [float] fb  = mel_filterbank(n_mels, 400, 16000)
+
+    # ── GPU pipeline ───────────────────────────────────────────────────────────
+    print "Running GPU pipeline (parallel interpreter)..."
+    let int stft_blocks = (n_frames + 255) / 256
+    let int mel_blocks  = (n_frames + 255) / 256
+
+    mut k_stft = StftPower(padded, win, n_frames, 160, n_padded, 400, n_freq)
+    kernel:
+        k_stft(block = 256, grid = stft_blocks)
+    print "  StftPower done — power[0] = {k_stft.power[0]:.4f}"
+
+    mut k_mel = MelApply(fb, k_stft.power, n_mels, n_frames, n_freq)
+    kernel:
+        k_mel(block = 256, grid = mel_blocks)
+    print "  MelApply done — mel[0] = {k_mel.mel[0]:.4f}"
+
+    let float clamp_val = 1e-10
+
+    mut k_log = LogCompress(k_mel.mel, clamp_val, n_mels, n_frames)
+    kernel:
+        k_log(block = 256, grid = mel_blocks)
+    print "  LogCompress done — log_mel[0] = {k_log.mel_out[0]:.4f}"
+
+    print "GPU pipeline complete."

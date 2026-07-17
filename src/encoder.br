@@ -1,0 +1,100 @@
+# src/encoder.br — Whisper audio encoder
+#
+# Architecture (for "base" model, d=512, n_head=8, n_layer=6):
+#   Conv1d(80 → 512, k=3, GELU)
+#   Conv1d(512 → 512, k=3, stride=2, GELU)
+#   + learned positional embedding (1500 × 512)
+#   6 × TransformerBlock (pre-norm, self-attention, MLP with GELU)
+#   LayerNorm(512)
+
+use math
+use math_gpu
+
+struct EncoderBlock:
+    # Self-attention
+    [float] attn_q_w
+    [float] attn_q_b
+    [float] attn_k_w   # no bias on K in Whisper encoder
+    [float] attn_v_w
+    [float] attn_v_b
+    [float] attn_o_w
+    [float] attn_o_b
+    # Layer norms
+    [float] ln1_w
+    [float] ln1_b
+    [float] ln2_w
+    [float] ln2_b
+    # MLP: d → 4d → d with GELU
+    [float] mlp_fc_w
+    [float] mlp_fc_b
+    [float] mlp_pr_w
+    [float] mlp_pr_b
+
+    req [float] forward([float] x, int seq, int d, int n_head) throws:
+        # Pre-norm self-attention + residual
+        let [float] h1  = layer_norm_seq_gpu(x, self.ln1_w, self.ln1_b, seq, d)
+        let [float] sa  = mha_gpu(h1, h1,
+            self.attn_q_w, self.attn_q_b,
+            self.attn_k_w, zeros(d),
+            self.attn_v_w, self.attn_v_b,
+            self.attn_o_w, self.attn_o_b,
+            seq, seq, d, n_head, false)
+        let [float] r1  = vec_add(x, sa)
+
+        # Pre-norm MLP + residual
+        let [float]'gpu'unified h2  = layer_norm_seq_gpu(r1, self.ln2_w, self.ln2_b, seq, d)
+        let [float]'gpu'unified fc  = linear_gpu(h2, self.mlp_fc_w, self.mlp_fc_b, seq, d, d * 4)
+        let [float]'gpu'unified act = gelu_gpu(fc)
+        let [float] pr  = linear_gpu(act, self.mlp_pr_w, self.mlp_pr_b, seq, d * 4, d)
+        vec_add(r1, pr)
+
+struct AudioEncoder:
+    # Convolutional stem
+    [float] conv1_w   # (512, 80, 3)
+    [float] conv1_b
+    [float] conv2_w   # (512, 512, 3)
+    [float] conv2_b
+    # Positional embedding: (1500, 512)
+    [float] pos_emb
+    # Transformer blocks
+    [EncoderBlock] blocks
+    # Final layer norm
+    [float] ln_w
+    [float] ln_b
+    # Model dimensions (stored explicitly because n_head can't be derived from weight shapes)
+    int n_head_val
+
+    req int d():      self.ln_w.length
+    req int n_head(): self.n_head_val
+
+    req [float] forward(MelSpectrogram mel) throws:
+        let int d      = self.d()
+        let int n_head = self.n_head()
+
+        # Conv stem: mel.data is (N_MELS × N_FRAMES), we need (N_FRAMES × N_MELS)
+        # Transpose to (T × C_in) for conv1d
+        let int t_in = mel.n_frames
+        var [float] x = []
+        for f in 0..t_in:
+            for m in 0..mel.n_mels:
+                x.push(mel.data[m * t_in + f])
+
+        # Conv1(80 → d, k=3, stride=1) + GELU
+        let [float]'gpu'unified c1 = conv1d_gpu(x, self.conv1_w, self.conv1_b, t_in, mel.n_mels, d, 3, 1, t_in)
+        var [float]'gpu'unified a1 = gelu_gpu(c1)
+
+        # Conv2(d → d, k=3, stride=2) + GELU — halves the sequence length to 1500
+        let int t_out = t_in / 2
+        let [float]'gpu'unified c2 = conv1d_gpu(a1, self.conv2_w, self.conv2_b, t_in, d, d, 3, 2, t_out)
+        var [float] a2 = gelu_gpu(c2)
+
+        # Add positional embedding
+        guard a2.length == self.pos_emb.length else throw "encoder: positional embedding size mismatch"
+        var [float] h = vec_add(a2, self.pos_emb)
+
+        # Transformer blocks
+        for block in self.blocks:
+            h = block.forward(h, t_out, d, n_head)
+
+        # Final layer norm
+        layer_norm_seq_gpu(h, self.ln_w, self.ln_b, t_out, d)

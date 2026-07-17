@@ -1,0 +1,229 @@
+# src/decoder.br — Whisper text decoder
+#
+# Architecture (for "base" model, d=512, n_head=8, n_layer=6):
+#   token embedding (51865 × 512) + positional embedding (448 × 512)
+#   6 × DecoderBlock (causal self-attn, cross-attn, MLP)
+#   LayerNorm(512)
+#   Linear → logits (512 → 51865), weight-tied with token embedding
+
+use math
+use math_gpu
+use tokenizer
+
+pub struct DecoderBlock:
+    # Causal self-attention
+    [float] sa_q_w
+    [float] sa_q_b
+    [float] sa_k_w
+    [float] sa_v_w
+    [float] sa_v_b
+    [float] sa_o_w
+    [float] sa_o_b
+    [float] ln1_w
+    [float] ln1_b
+    # Cross-attention (keys/values come from the audio encoder)
+    [float] ca_q_w
+    [float] ca_q_b
+    [float] ca_k_w
+    [float] ca_v_w
+    [float] ca_v_b
+    [float] ca_o_w
+    [float] ca_o_b
+    [float] ln2_w
+    [float] ln2_b
+    # MLP: d → 4d → d with GELU
+    [float] mlp_fc_w
+    [float] mlp_fc_b
+    [float] mlp_pr_w
+    [float] mlp_pr_b
+    [float] ln3_w
+    [float] ln3_b
+
+    # Incremental KV-cache state (see math_gpu.br's mha_step_gpu/
+    # mha_cross_step_gpu doc comment). Empty/unset until generate()'s first
+    # decode step; grown one token at a time by forward_step().
+    var [float] cache_sa_k = []
+    var [float] cache_sa_v = []
+    var [float] cache_ca_k = []
+    var [float] cache_ca_v = []
+    var bool    ca_cached  = false
+
+    # x:     (seq_t × d) — current text tokens
+    # audio: (seq_a × d) — encoder output (constant across blocks)
+    req [float] forward([float] x, [float] audio,
+                        int seq_t, int seq_a, int d, int n_head) throws:
+        # Causal self-attention + residual
+        let [float] h1  = layer_norm_seq_gpu(x, self.ln1_w, self.ln1_b, seq_t, d)
+        let [float] sa  = mha_gpu(h1, h1,
+            self.sa_q_w, self.sa_q_b,
+            self.sa_k_w, zeros(d),
+            self.sa_v_w, self.sa_v_b,
+            self.sa_o_w, self.sa_o_b,
+            seq_t, seq_t, d, n_head, true)
+        let [float] r1  = vec_add(x, sa)
+
+        # Cross-attention + residual
+        let [float] h2  = layer_norm_seq_gpu(r1, self.ln2_w, self.ln2_b, seq_t, d)
+        let [float] ca  = mha_gpu(h2, audio,
+            self.ca_q_w, self.ca_q_b,
+            self.ca_k_w, zeros(d),
+            self.ca_v_w, self.ca_v_b,
+            self.ca_o_w, self.ca_o_b,
+            seq_t, seq_a, d, n_head, false)
+        let [float] r2  = vec_add(r1, ca)
+
+        # MLP + residual
+        let [float]'gpu'unified h3  = layer_norm_seq_gpu(r2, self.ln3_w, self.ln3_b, seq_t, d)
+        let [float]'gpu'unified fc  = linear_gpu(h3, self.mlp_fc_w, self.mlp_fc_b, seq_t, d, d * 4)
+        let [float]'gpu'unified act = gelu_gpu(fc)
+        let [float] pr  = linear_gpu(act, self.mlp_pr_w, self.mlp_pr_b, seq_t, d * 4, d)
+        vec_add(r2, pr)
+
+    # Incremental (KV-cache) forward for ONE new token. `x_new` is the new
+    # token's (d,) embedding; `audio` is the (seq_a × d) encoder output.
+    # Mutates this block's cache fields — see the struct's cache field doc.
+    def [float] forward_step([float] x_new, [float] audio, int seq_a,
+                             int d, int n_head) throws:
+        # Cross-attention K/V only need computing once per utterance — the
+        # encoder output never changes across decode steps.
+        if not self.ca_cached:
+            self.cache_ca_k = linear_gpu(audio, self.ca_k_w, zeros(d), seq_a, d, d)
+            self.cache_ca_v = linear_gpu(audio, self.ca_v_w, self.ca_v_b, seq_a, d, d)
+            self.ca_cached  = true
+
+        # Causal self-attention + residual. `h1` stays GPU-resident straight
+        # into `mha_step_gpu`'s own `x_new` (its only use there is forwarding
+        # into `linear_gpu`, so it qualifies transitively) — no readback here.
+        # `sa` (a tuple-destructured binding) materializes by default since it
+        # feeds straight into `vec_add`, a real CPU op — nothing further is
+        # gained by keeping it resident past this point (same total readback
+        # count either way as materializing inside `mha_step_gpu` instead).
+        let [float]'gpu'unified h1 = layer_norm_seq_gpu(x_new, self.ln1_w, self.ln1_b, 1, d)
+        let (sa, new_sa_k, new_sa_v) = mha_step_gpu(h1,
+            self.sa_q_w, self.sa_q_b,
+            self.sa_k_w, zeros(d),
+            self.sa_v_w, self.sa_v_b,
+            self.sa_o_w, self.sa_o_b,
+            self.cache_sa_k, self.cache_sa_v,
+            d, n_head)
+        self.cache_sa_k = new_sa_k
+        self.cache_sa_v = new_sa_v
+        let [float] r1 = vec_add(x_new, sa)
+
+        # Cross-attention + residual. `h2` stays resident into
+        # `mha_cross_step_gpu`'s own `x_new` the same way `h1` does above.
+        let [float]'gpu'unified h2 = layer_norm_seq_gpu(r1, self.ln2_w, self.ln2_b, 1, d)
+        let [float] ca = mha_cross_step_gpu(h2,
+            self.ca_q_w, self.ca_q_b,
+            self.cache_ca_k, self.cache_ca_v,
+            self.ca_o_w, self.ca_o_b,
+            seq_a, d, n_head)
+        let [float] r2 = vec_add(r1, ca)
+
+        # MLP + residual
+        let [float]'gpu'unified h3  = layer_norm_seq_gpu(r2, self.ln3_w, self.ln3_b, 1, d)
+        let [float]'gpu'unified fc  = linear_gpu(h3, self.mlp_fc_w, self.mlp_fc_b, 1, d, d * 4)
+        let [float]'gpu'unified act = gelu_gpu(fc)
+        let [float] pr  = linear_gpu(act, self.mlp_pr_w, self.mlp_pr_b, 1, d * 4, d)
+        vec_add(r2, pr)
+
+pub struct TextDecoder:
+    [float]        tok_emb      # (n_vocab × d) -- embedding lookup layout (row per token)
+    [float]        tok_emb_t    # (d × n_vocab) -- same weights, pre-transposed once at load
+                                 # for linear_gpu's output-projection use (weight-tied LM
+                                 # head): the two uses need opposite layouts, so both are
+                                 # kept rather than transposing `tok_emb` in place.
+    [float]        pos_emb      # (max_ctx × d)
+    var [DecoderBlock] blocks
+    [float]        ln_w
+    [float]        ln_b
+    int            n_head_val
+
+    req int d():       self.ln_w.length
+    req int n_vocab(): self.tok_emb.length / self.d()
+    req int n_head():  self.n_head_val
+
+    # Run the decoder for the given token sequence, return logits for the last position.
+    req [float] forward([int] tokens, [float] audio, int seq_a) throws:
+        let int d      = self.d()
+        let int n_head = self.n_head()
+        let int seq_t  = tokens.length
+
+        guard seq_t <= 448 else throw "decoder: sequence exceeds maximum context (448)"
+
+        # Token + positional embeddings
+        var [float] x = []
+        for i in 0..seq_t:
+            let int tid = tokens[i]
+            for j in 0..d:
+                x.push(self.tok_emb[tid * d + j] + self.pos_emb[i * d + j])
+
+        # Transformer blocks
+        for block in self.blocks:
+            x = block.forward(x, audio, seq_t, seq_a, d, n_head)
+
+        # Layer norm on last position only
+        # (parens around both range bounds are load-bearing — see math.br's
+        # layer_norm_seq for why: the boring transpiler binds `..` tighter than `*`)
+        let [float] last    = x[((seq_t - 1) * d)..(seq_t * d)]
+        let [float] normed  = layer_norm_seq_gpu(last, self.ln_w, self.ln_b, 1, d)
+
+        # Project to vocab (weight-tied: reuse tok_emb transposed, no bias).
+        # This is the single largest matmul in the model (n_vocab × d), run
+        # once per generated token — the biggest win from GPU offload here.
+        let int n_vocab = self.n_vocab()
+        linear_gpu(normed, self.tok_emb_t, zeros(n_vocab), 1, d, n_vocab)
+
+    # Incremental forward for ONE new token at position `pos` (KV-cache).
+    # Mutates every block's cache (see DecoderBlock.forward_step). Returns
+    # logits predicting the token that comes after position `pos`.
+    def [float] forward_step_all(int token_id, int pos, [float] audio, int seq_a) throws:
+        let int d      = self.d()
+        let int n_head = self.n_head()
+
+        guard pos < 448 else throw "decoder: sequence exceeds maximum context (448)"
+
+        var [float] x_new = []
+        for j in 0..d:
+            x_new.push(self.tok_emb[token_id * d + j] + self.pos_emb[pos * d + j])
+
+        for i in 0..self.blocks.length:
+            x_new = self.blocks[i].forward_step(x_new, audio.clone(), seq_a, d, n_head)
+
+        let [float] normed = layer_norm_seq_gpu(x_new, self.ln_w, self.ln_b, 1, d)
+
+        let int n_vocab = self.n_vocab()
+        linear_gpu(normed, self.tok_emb_t, zeros(n_vocab), 1, d, n_vocab)
+
+    # Greedy decode: generate tokens until EOT or max_new_tokens.
+    # KV-cache: each new token only costs a single incremental forward step,
+    # instead of reprocessing every previous token from scratch (see
+    # forward_step_all / DecoderBlock.forward_step).
+    def [int] generate([float] audio, int seq_a, int max_new_tokens) throws:
+        let [int] prompt = [TOK_SOT, TOK_LANG_EN, TOK_TRANSCRIBE, TOK_NO_TIMESTAMPS]
+
+        var [float] logits = []
+        var int pos = 0
+        for tid in prompt:
+            logits = self.forward_step_all(tid, pos, audio, seq_a)
+            pos += 1
+
+        var [int] generated = []
+        var int steps = 0
+        while steps < max_new_tokens:
+            # Argmax over vocab
+            var int   best_id  = 0
+            var float best_val = logits[0]
+            for v in 0..logits.length:
+                if logits[v] > best_val:
+                    best_val = logits[v]
+                    best_id  = v
+
+            if best_id == TOK_EOT: break
+            generated.push(best_id)
+            steps += 1
+
+            logits = self.forward_step_all(best_id, pos, audio, seq_a)
+            pos += 1
+
+        generated

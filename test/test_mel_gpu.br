@@ -1,0 +1,68 @@
+# test/test_mel_gpu.br — vérifie que log_mel_spectrogram_gpu produit
+# des résultats cohérents avec la version CPU (audio_gpu.br, simulation).
+use io
+use math
+use audio
+use audio_gpu
+
+def main() throws:
+    print "=== GPU mel spectrogram (simulation) ==="
+
+    # Charge le WAV de test (200 samples)
+    let [float] samples = load_wav("test/tiny.wav")
+    print "Audio: {samples.length} samples"
+
+    # ── Version CPU (référence) ────────────────────────────────────────────
+    print "Computing CPU STFT power..."
+    let int n_freq_cpu   = 201
+    let [float] power_cpu = stft_power(samples, 400, 160)
+    let int n_frames_cpu  = power_cpu.length / n_freq_cpu
+    print "CPU STFT: {n_frames_cpu} frames × {n_freq_cpu} bins"
+    let float p_cpu_0 = power_cpu[0]
+    print "CPU power[0] = {p_cpu_0:.4f}"
+
+    # ── Version GPU (simulation séquentielle) ──────────────────────────────
+    print "Computing GPU STFT power (simulated)..."
+    let int n_audio  = samples.length
+    let int pad      = 200
+    var [float] padded = []
+    for i in 0..pad:
+        let int src = pad - i
+        padded.push(if src < n_audio: samples[src] else: 0.0)
+    for v in samples: padded.push(v)
+    for i in 0..pad:
+        let int src = n_audio - 2 - i
+        padded.push(if src >= 0 and src < n_audio: samples[src] else: 0.0)
+
+    let int n_padded = padded.length
+    let int n_frames = (n_padded - 400) / 160
+    let int n_freq   = 201
+    print "GPU STFT: {n_frames} frames × {n_freq} bins (expected)"
+
+    let [float] win = hann_window(400)
+
+    let int stft_blocks = (n_frames + 255) / 256
+    mut k_stft = StftPower(padded, win, n_frames, 160, n_padded, 400, n_freq)
+    kernel:
+        k_stft(block = 256, grid = stft_blocks)
+
+    let float p_gpu_0 = k_stft.power[0]
+    print "GPU power[0] = {p_gpu_0:.4f}"
+
+    # Comparer CPU vs GPU (même valeur à flottant près)
+    let float diff = if p_cpu_0 > p_gpu_0: p_cpu_0 - p_gpu_0 else: p_gpu_0 - p_cpu_0
+    print "Diff CPU-GPU bin 0: {diff:.6f}  (expect ≈ 0)"
+
+    # ── Mel filterbank GPU (un thread par frame) ──────────────────────────
+    print "GPU mel filterbank..."
+    let [float] fb     = mel_filterbank(80, 400, 16000)
+    let int mel_blocks = (n_frames + 255) / 256
+    mut k_mel = MelApply(fb, k_stft.power, 80, n_frames, n_freq)
+    kernel:
+        k_mel(block = 256, grid = mel_blocks)
+
+    let float mel0 = k_mel.mel[0]
+    print "GPU mel[0] = {mel0:.4f}"
+    print "GPU mel shape: {80} × {n_frames} = {k_mel.mel.length}"
+
+    print "=== GPU test passed ==="

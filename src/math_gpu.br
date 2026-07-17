@@ -1,0 +1,584 @@
+# src/math_gpu.br — GPU-accelerated transformer math (matmul, attention, layer
+# norm, GELU, conv1d), mirroring audio_gpu.br's kernel pattern.
+#
+# Build targets:
+#   boring build --target wgpu   # DirectX 12 / Vulkan / Metal (cross-platform)
+#   boring build --target cuda   # NVIDIA GPU
+#   boring build --target metal  # Apple GPU (macOS / iOS)
+#
+# Interpreter simulation (sequential, for development):
+#   boring run test/test_math_gpu.br
+#
+# Kernel design
+# ─────────────
+# Most kernels below flatten their output into a 1D grid: thread
+# `gpu.block.x * gpu.block_dim.x + gpu.thread.x` owns exactly one output cell
+# (or, for the row-wise kernels, one full row), so there is no inter-thread
+# dependency and the sequential interpreter simulation is correct.
+#
+# LinearKernel and MatMulBTHeadsKernel are the exception: both are tiled GEMMs
+# using 2D thread blocks and block-shared (`'sync`) memory — every thread
+# cooperatively loads part of a tile, then reads tile entries written by OTHER
+# threads in the same block after a barrier. `boring run`'s kernel simulation
+# executes each thread's body independently to completion and merges field
+# writes afterward (`sync` is a documented no-op there — see
+# `test_sync_is_noop` in boring's interpreter test suite); it has no notion of
+# one thread observing another thread's write mid-kernel, so it CANNOT
+# validate these two kernels' logic — `boring run test/test_math_gpu.br` will
+# show nonzero diffs for anything that routes through them (linear_gpu,
+# attention_heads_gpu, mha_gpu, mha_step_gpu, mha_cross_step_gpu) even when the
+# real GPU result is bit-exact. The real wgpu build (`test/test_math_gpu.br`
+# et al. run via `--target wgpu`) is the correctness oracle for these two.
+#
+# LinearKernel       — 16x16-tiled GEMM: y = x·Wᵀ + b. Used for every Q/K/V/O
+#                      projection and MLP fc/proj.
+# MatMulBTHeadsKernel — 16x16-tiled per-head Q·Kᵀ (scale + optional causal
+#                      mask); grid.z selects the head so one dispatch still
+#                      covers every head.
+# SoftmaxRowsKernel  — one thread per row: max, exp-sum, normalize.
+# MatMulHeadsKernel  — one thread per (i, j) cell: plain A·B (weights · V) —
+#                      not tiled (already coalesced — see its doc comment).
+# LayerNormSeqKernel — one thread per row: mean/variance/normalize.
+# GeluKernel         — one thread per element.
+# Conv1dKernel       — one thread per (position, out-channel) cell. Handles
+#                      both the encoder's stride-1 and stride-2 convolutions.
+
+use math
+
+# ── Kernel: matrix transpose ──────────────────────────────────────────────────
+# Grid: ceil(rows * cols / 256).  Block: 256 threads.  One thread per input cell.
+#
+# Used ahead of LinearKernel/MatMulBTHeadsKernel to fix a real memory-coalescing
+# bug: both kernels originally read their second matrix (`w`, `k`) with the
+# per-thread-varying index as the OUTER (stride-d_in / stride-d) dimension, so
+# consecutive GPU threads (same warp/wavefront, same reduction step `p`) touched
+# addresses `d_in` (or `d`) floats apart instead of adjacent ones — a scattered,
+# non-coalesced access pattern instead of one wide coalesced read. Transposing
+# once up front (O(rows·cols), negligible next to the O(seq·rows·cols)-ish matmul
+# it feeds) makes the hot loop's second-operand read contiguous across threads.
+
+kernel TransposeKernel:
+    let [float]'global   src      # (rows × cols)
+    mut [float]'unified  dst      # output: (cols × rows)
+    let int              rows
+    let int              cols
+
+    init([float]'global s, int r, int c):
+        src  = s
+        rows = r
+        cols = c
+        dst  = [0.0 for ..r * c]
+
+    def ():
+        # 2D grid (see `transpose_gpu`): a single dispatch dimension caps out at
+        # 65535 blocks, which `tok_emb` (the tied vocabulary projection weight,
+        # d_out ~ 51865) overflows on its own — linearize block.x/block.y back
+        # into one flat block index via grid_dim.x before recovering the cell.
+        let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
+        let cell = gpu.thread.x + block_idx * gpu.block_dim.x
+        if cell < rows * cols:
+            let i = cell / cols
+            let j = cell % cols
+            dst[j * rows + i] = src[cell]
+
+pub req [float]'gpu'unified transpose_gpu([float] src, int rows, int cols) throws:
+    let int n_cells = rows * cols
+    let int blocks  = (n_cells + 255) / 256
+    # wgpu/D3D12/Vulkan cap a single dispatch dimension at 65535 -- spread
+    # across a second grid dimension once `blocks` alone would overflow it.
+    let int gx = if blocks > 65535: 65535 else: blocks
+    let int gy = (blocks + gx - 1) / gx
+    mut k = TransposeKernel(src, rows, cols)
+    kernel:
+        k(block = 256, grid = (gx, gy))
+    k.dst
+
+# ── Kernel: linear layer (y = x·Wᵀ + b) ──────────────────────────────────────
+# Grid: ceil(seq * d_out / 256).  Block: 256 threads.
+#
+# `w` is expected PRE-TRANSPOSED by the caller to (d_in × d_out) —
+# `w[p * d_out + j]` — so the inner loop's second read is contiguous across
+# threads (consecutive `j`) instead of `d_in`-strided. `linear_gpu` used to
+# transpose `w` itself on every call via `transpose_gpu`, but every real
+# caller passes a STATIC weight matrix (loaded once from WBRF, reused
+# identically across every position/layer/decode-step it's used for) — paying
+# a fresh transpose (construct a kernel, zero-fill-then-overwrite a same-size
+# output buffer, dispatch) on every single call was pure waste. Callers now
+# pre-transpose once, at load time, via `math.br`'s CPU-side `transpose_flat`
+# (see model.br's `load_whisper`) — cheap, since it happens exactly once per
+# weight tensor for the whole program's lifetime, unlike the GPU round-trip
+# this used to pay on every call.
+
+kernel LinearKernel:
+    let [float]'global  x         # (seq × d_in)
+    let [float]'global  w         # (d_in × d_out) — pre-transposed
+    let [float]'global  bv        # (d_out,)
+    mut [float]'unified y         # output: seq × d_out
+    let int             seq
+    let int             d_in
+    let int             d_out
+    mut [float, 256]'sync tile_x  # 16 x 16 tile of x
+    mut [float, 256]'sync tile_w  # 16 x 16 tile of w
+
+    init([float]'global xi, [float]'global wi, [float]'global bi,
+         int s, int din, int dout):
+        x     = xi
+        w     = wi
+        bv    = bi
+        seq   = s
+        d_in  = din
+        d_out = dout
+        y     = [0.0 for ..s * dout]
+
+    # Standard 16x16-tiled GEMM: each thread owns one (row, col) output cell
+    # and walks the d_in (reduction) dimension in 16-wide chunks, cooperatively
+    # staging one tile of `x` and one tile of `w` into block-shared memory per
+    # chunk instead of every thread re-reading its own row/column from global
+    # memory independently (the old design — see the file header). This cuts
+    # global-memory traffic by ~16x for the reduction dimension since 16
+    # threads now share one coalesced load instead of each repeating it.
+    def ():
+        let tx = gpu.thread.x
+        let ty = gpu.thread.y
+        let row = gpu.block.y * gpu.block_dim.y + ty
+        let col = gpu.block.x * gpu.block_dim.x + tx
+        var float acc = 0.0
+        let num_tiles = (d_in + 15) / 16
+        for t in 0..num_tiles:
+            let x_col = t * 16 + tx
+            let w_row = t * 16 + ty
+            if row < seq and x_col < d_in:
+                tile_x[ty * 16 + tx] = x[row * d_in + x_col]
+            else:
+                tile_x[ty * 16 + tx] = 0.0
+            if w_row < d_in and col < d_out:
+                tile_w[ty * 16 + tx] = w[w_row * d_out + col]
+            else:
+                tile_w[ty * 16 + tx] = 0.0
+            sync
+            for kk in 0..16:
+                acc += tile_x[ty * 16 + kk] * tile_w[kk * 16 + tx]
+            sync
+        if row < seq and col < d_out:
+            y[row * d_out + col] = acc + bv[col]
+
+pub req [float]'gpu'unified linear_gpu([float] x, [float] w, [float] bv,
+                       int seq, int d_in, int d_out) throws:
+    # 2D grid, one 16x16 tile per block. `d_out` tops out at n_vocab (~51865)
+    # in this model, so gx (~3242 at TILE=16) stays well under the 65535
+    # per-dimension dispatch cap — no TransposeKernel-style gy overflow split
+    # needed here.
+    let int gx = (d_out + 15) / 16
+    let int gy = (seq + 15) / 16
+    mut k = LinearKernel(x, w, bv, seq, d_in, d_out)
+    kernel:
+        k(block = (16, 16), grid = (gx, gy))
+    k.y
+
+# ── Kernel: attention scores, ALL HEADS in one dispatch (scale·Q·Kᵀ, optional
+# causal mask) ────────────────────────────────────────────────────────────────
+# Grid: ceil(n_head * seq_q * seq_k / 256).  Block: 256 threads.
+#
+# `q`/`k` are full-width (seq × d, every head interleaved) — same layout the
+# Q/K/V projections already produce, so no host-side per-head slicing is
+# needed before this kernel runs. Each thread picks its head `h` out of the
+# flattened cell index and reads/writes the (h, i, j) slice directly.
+#
+# `k` here is pre-transposed by `attention_heads_gpu` (see `transpose_gpu`) to
+# (d × seq_k) — `k_t[(off + p) * seq_k + j]` — so the inner loop's key read is
+# contiguous across threads (consecutive `j`, i.e. consecutive key positions)
+# instead of `d`-strided (same coalescing fix as `LinearKernel`'s `w`).
+
+kernel MatMulBTHeadsKernel:
+    let [float]'global  q          # (seq_q × d)
+    let [float]'global  k          # (d × seq_k) — pre-transposed
+    mut [float]'unified c          # output: (n_head × seq_q × seq_k)
+    let int             seq_q
+    let int             seq_k
+    let int             d
+    let int             d_head
+    let int             n_head
+    let float           scale
+    let int             causal     # 0 = off, 1 = causal mask
+    mut [float, 256]'sync tile_q   # 16 x 16 tile of q (one head's slice)
+    mut [float, 256]'sync tile_k   # 16 x 16 tile of k_t (one head's slice)
+
+    init([float]'global qi, [float]'global ki,
+         int sq, int sk, int dd, int dh, int nh, float sc, int caus):
+        q      = qi
+        k      = ki
+        seq_q  = sq
+        seq_k  = sk
+        d      = dd
+        d_head = dh
+        n_head = nh
+        scale  = sc
+        causal = caus
+        c      = [0.0 for ..nh * sq * sk]
+
+    # Tiled per-head matmul (scale·Q·Kᵀ): grid.z picks the head (one dispatch
+    # still covers every head — see attention_heads_gpu — no host-side per-head
+    # loop), grid.x/y tile the (seq_q x seq_k) score matrix the same way
+    # LinearKernel tiles its GEMM, reducing over d_head in 16-wide chunks
+    # staged through shared memory instead of every thread re-reading q/k_t
+    # from global memory independently.
+    def ():
+        let tx  = gpu.thread.x
+        let ty  = gpu.thread.y
+        let h   = gpu.block.z
+        let i   = gpu.block.y * gpu.block_dim.y + ty
+        let j   = gpu.block.x * gpu.block_dim.x + tx
+        let off = h * d_head
+        var float s = 0.0
+        let num_tiles = (d_head + 15) / 16
+        for t in 0..num_tiles:
+            let p = t * 16
+            if i < seq_q and (p + tx) < d_head:
+                tile_q[ty * 16 + tx] = q[i * d + off + p + tx]
+            else:
+                tile_q[ty * 16 + tx] = 0.0
+            if j < seq_k and (p + ty) < d_head:
+                tile_k[ty * 16 + tx] = k[(off + p + ty) * seq_k + j]
+            else:
+                tile_k[ty * 16 + tx] = 0.0
+            sync
+            for kk in 0..16:
+                s += tile_q[ty * 16 + kk] * tile_k[kk * 16 + tx]
+            sync
+        s = s / scale
+        if causal == 1 and j > i:
+            s = -1e9
+        if i < seq_q and j < seq_k:
+            c[h * seq_q * seq_k + i * seq_k + j] = s
+
+# ── Kernel: row-wise softmax ──────────────────────────────────────────────────
+# Grid: ceil(rows / 256).  Block: 256 threads.  One thread per row.
+# Reused as-is for multi-head scores: called with rows = n_head * seq_q — each
+# head's rows are independent softmax rows of the same width (seq_k), so no
+# head-awareness is needed in this kernel itself.
+
+kernel SoftmaxRowsKernel:
+    let [float]'global   scores_in
+    mut [float]'unified  probs
+    let int              rows
+    let int              cols
+
+    init([float]'global s, int r, int c):
+        scores_in = s
+        rows      = r
+        cols      = c
+        probs     = [0.0 for ..r * c]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < rows:
+            let base = i * cols
+            var float mx = scores_in[base]
+            for j in 0..cols:
+                if scores_in[base + j] > mx: mx = scores_in[base + j]
+            var float total = 0.0
+            for j in 0..cols:
+                let e = (scores_in[base + j] - mx).exp()
+                probs[base + j] = e
+                total += e
+            for j in 0..cols:
+                probs[base + j] = probs[base + j] / total
+
+# ── Kernel: attention output, ALL HEADS in one dispatch (probs · V) ─────────
+# Grid: ceil(seq_q * d / 256).  Block: 256 threads.
+#
+# Writes directly into the full-width (seq_q × d) layout the `w_o` projection
+# expects — each thread recovers its head from the output column, so the
+# per-head reassembly loop that used to run on the host after this step is
+# gone entirely.
+
+kernel MatMulHeadsKernel:
+    let [float]'global  probs      # (n_head × seq_q × seq_k)
+    let [float]'global  v          # (seq_k × d)
+    mut [float]'unified c          # output: (seq_q × d), already full-width
+    let int             seq_q
+    let int             seq_k
+    let int             d
+    let int             d_head
+    let int             n_head
+
+    init([float]'global pi, [float]'global vi,
+         int sq, int sk, int dd, int dh, int nh):
+        probs  = pi
+        v      = vi
+        seq_q  = sq
+        seq_k  = sk
+        d      = dd
+        d_head = dh
+        n_head = nh
+        c      = [0.0 for ..sq * dd]
+
+    def ():
+        let cell = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if cell < seq_q * d:
+            let i   = cell / d
+            let col = cell % d
+            let h   = col / d_head
+            let jl  = col % d_head
+            var float s = 0.0
+            for p in 0..seq_k:
+                s += probs[h * seq_q * seq_k + i * seq_k + p] * v[p * d + h * d_head + jl]
+            c[cell] = s
+
+# Multi-head scaled dot-product attention (GPU), all heads in ONE dispatch per
+# stage (scores / softmax / context) instead of one dispatch triple per head.
+# `q`/`k`/`v` are full-width (seq × d) exactly as the Q/K/V projections already
+# produce them — no host-side per-head slicing or reassembly needed.
+pub req [float]'gpu'unified attention_heads_gpu([float] q, [float] k, [float] v,
+                          int seq_q, int seq_k, int d, int n_head,
+                          bool causal) throws:
+    let int d_head    = d / n_head
+    let float scale   = float(d_head).sqrt()
+    let int causal_i  = if causal: 1 else: 0
+
+    let [float]'gpu'unified k_t = transpose_gpu(k, seq_k, d)
+
+    # 3D grid: (seq_k tiles, seq_q tiles, n_head) — grid.z selects the head, so
+    # every head still runs in this one dispatch (no host-side per-head loop),
+    # while grid.x/y give each head clean 16x16 tiling (see MatMulBTHeadsKernel).
+    let int score_gx = (seq_k + 15) / 16
+    let int score_gy = (seq_q + 15) / 16
+    mut k_scores = MatMulBTHeadsKernel(q, k_t, seq_q, seq_k, d, d_head, n_head, scale, causal_i)
+    kernel:
+        k_scores(block = (16, 16), grid = (score_gx, score_gy, n_head))
+
+    let int soft_rows  = n_head * seq_q
+    let int row_blocks = (soft_rows + 255) / 256
+    mut k_soft = SoftmaxRowsKernel(k_scores.c, soft_rows, seq_k)
+    kernel:
+        k_soft(block = 256, grid = row_blocks)
+
+    let int out_cells  = seq_q * d
+    let int out_blocks = (out_cells + 255) / 256
+    mut k_ctx = MatMulHeadsKernel(k_soft.probs, v, seq_q, seq_k, d, d_head, n_head)
+    kernel:
+        k_ctx(block = 256, grid = out_blocks)
+
+    k_ctx.c
+
+# Multi-head attention (GPU). Mirrors math.br's `mha`: projections run as
+# full-width GPU linear kernels, and attention itself runs all heads in one
+# dispatch per stage (attention_heads_gpu) instead of looping per head on the
+# host.
+#
+# `w_q`/`w_k`/`w_v`/`w_o` are forwarded straight into `linear_gpu` and so carry
+# the same pre-transposed (d_in × d_out) contract — see `linear_gpu`'s doc
+# comment. Every real caller (`EncoderBlock`/`DecoderBlock`) passes a struct
+# field that `model.br`'s `load_whisper` pre-transposed once at load time.
+pub req [float]'gpu'unified mha_gpu([float] x_q,  [float] x_kv,
+                    [float] w_q,  [float] b_q,
+                    [float] w_k,  [float] b_k,
+                    [float] w_v,  [float] b_v,
+                    [float] w_o,  [float] b_o,
+                    int seq_q, int seq_k, int d, int n_head,
+                    bool causal) throws:
+    let [float]'gpu'unified Q = linear_gpu(x_q,  w_q, b_q, seq_q, d, d)
+    let [float]'gpu'unified K = linear_gpu(x_kv, w_k, b_k, seq_k, d, d)
+    let [float]'gpu'unified V = linear_gpu(x_kv, w_v, b_v, seq_k, d, d)
+
+    let [float]'gpu'unified concat = attention_heads_gpu(Q, K, V, seq_q, seq_k, d, n_head, causal)
+
+    linear_gpu(concat, w_o, b_o, seq_q, d, d)
+
+# ── Incremental (KV-cache) attention for greedy decoding ─────────────────────
+#
+# `mha_gpu` above recomputes every position's K/V from scratch on every call,
+# which `TextDecoder.generate`'s greedy loop used to do once per generated
+# token — reprocessing the entire token sequence so far every single step
+# (O(seq²) over a full generation). The two functions below let the decoder
+# cache each block's self-attention K/V (grown one token at a time) and
+# cross-attention K/V (computed once from the encoder output, which never
+# changes across steps), so each decode step only does the work for the one
+# new token.
+#
+# Caution found empirically (see whisper-boring session notes): passing a
+# struct field as a `var [T]` parameter to mutate it in place does NOT work —
+# neither the interpreter nor the transpiled Rust actually writes the
+# mutation back to the field. Both functions instead take the cache as a
+# plain (read-only) `[float]` and RETURN the grown cache as an extra tuple
+# element; the caller (`DecoderBlock.forward_step`) reassigns its own field
+# from that return value, which does work correctly (verified against both
+# `boring run` and a real `cargo build` of the reduced repro).
+
+# One incremental step of causal self-attention. `cache_k`/`cache_v` hold all
+# previous positions' K/V (seq_prev × d, flat, full-width — not yet split by
+# head). Returns (attention output for the new token (1 × d), grown cache_k,
+# grown cache_v). The output stays GPU-resident (chained straight from
+# `linear_gpu`) so a caller forwarding it into another GPU-consuming call pays
+# no readback here; `new_cache_k`/`new_cache_v` are inherently host-side (grown
+# via a plain CPU push loop below) and can't be resident.
+#
+# `w_q`/`w_k`/`w_v`/`w_o` carry the same pre-transposed contract as `mha_gpu`'s
+# (forwarded straight into `linear_gpu` — see its doc comment).
+pub req ([float]'gpu'unified, [float], [float]) mha_step_gpu([float] x_new,
+                    [float] w_q,  [float] b_q,
+                    [float] w_k,  [float] b_k,
+                    [float] w_v,  [float] b_v,
+                    [float] w_o,  [float] b_o,
+                    [float] cache_k, [float] cache_v,
+                    int d, int n_head) throws:
+    let [float]'gpu'unified q_new = linear_gpu(x_new, w_q, b_q, 1, d, d)
+    let [float] k_new = linear_gpu(x_new, w_k, b_k, 1, d, d)
+    let [float] v_new = linear_gpu(x_new, w_v, b_v, 1, d, d)
+
+    var [float] new_cache_k = cache_k
+    var [float] new_cache_v = cache_v
+    for v in k_new: new_cache_k.push(v)
+    for v in v_new: new_cache_v.push(v)
+    let int seq_k = new_cache_k.length / d
+
+    # No causal mask needed: the single new query is always the last (most
+    # recent) position, so every key already in the cache is a legitimate
+    # position to attend to — that's what "causal" means for the newest token.
+    let [float]'gpu'unified concat = attention_heads_gpu(q_new, new_cache_k, new_cache_v, 1, seq_k, d, n_head, false)
+
+    let [float]'gpu'unified out = linear_gpu(concat, w_o, b_o, 1, d, d)
+    (out, new_cache_k, new_cache_v)
+
+# One incremental step of cross-attention against a FIXED, precomputed K/V
+# cache (the encoder output, `cache_k`/`cache_v`, seq_a × d — computed once
+# before the first decode step and passed unchanged on every subsequent call;
+# unlike `mha_step_gpu` there is nothing to grow here).
+#
+# `w_q`/`w_o` carry the same pre-transposed contract as `mha_gpu`'s (forwarded
+# straight into `linear_gpu`). `cache_k`/`cache_v` are activations (already
+# computed via a pre-transposed-weight `linear_gpu` call in
+# `DecoderBlock.forward_step`), not weights — nothing to transpose here.
+pub req [float]'gpu'unified mha_cross_step_gpu([float] x_new,
+                    [float] w_q, [float] b_q,
+                    [float] cache_k, [float] cache_v,
+                    [float] w_o, [float] b_o,
+                    int seq_a, int d, int n_head) throws:
+    let [float]'gpu'unified q_new = linear_gpu(x_new, w_q, b_q, 1, d, d)
+    let [float]'gpu'unified concat = attention_heads_gpu(q_new, cache_k, cache_v, 1, seq_a, d, n_head, false)
+    linear_gpu(concat, w_o, b_o, 1, d, d)
+
+# ── Kernel: layer norm (row-wise) ─────────────────────────────────────────────
+# Grid: ceil(seq / 256).  Block: 256 threads.  One thread per row.
+
+kernel LayerNormSeqKernel:
+    let [float]'global   x
+    let [float]'global   w
+    let [float]'global   bv
+    mut [float]'unified  out
+    let int              seq
+    let int              d
+
+    init([float]'global xi, [float]'global wi, [float]'global bi, int s, int dd):
+        x   = xi
+        w   = wi
+        bv  = bi
+        seq = s
+        d   = dd
+        out = [0.0 for ..s * dd]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < seq:
+            let base = i * d
+            var float mu = 0.0
+            for j in 0..d:
+                mu += x[base + j]
+            mu = mu / float(d)
+            var float v = 0.0
+            for j in 0..d:
+                let diff = x[base + j] - mu
+                v += diff * diff
+            v = v / float(d)
+            let sd = (v + 1e-5).sqrt()
+            for j in 0..d:
+                out[base + j] = w[j] * (x[base + j] - mu) / sd + bv[j]
+
+pub req [float]'gpu'unified layer_norm_seq_gpu([float] x, [float] w, [float] b,
+                               int seq, int d) throws:
+    let int blocks = (seq + 255) / 256
+    mut k = LayerNormSeqKernel(x, w, b, seq, d)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── Kernel: GELU (elementwise) ────────────────────────────────────────────────
+# Grid: ceil(n / 256).  Block: 256 threads.
+
+kernel GeluKernel:
+    let [float]'global   x
+    mut [float]'unified  out
+    let int              n
+
+    init([float]'global xi, int ni):
+        x   = xi
+        n   = ni
+        out = [0.0 for ..ni]
+
+    def ():
+        let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if i < n:
+            let v = x[i]
+            out[i] = 0.5 * v * (1.0 + (0.7978845608 * (v + 0.044715 * v * v * v)).tanh())
+
+pub req [float]'gpu'unified gelu_gpu([float] x) throws:
+    let int n      = x.length
+    let int blocks = (n + 255) / 256
+    mut k = GeluKernel(x, n)
+    kernel:
+        k(block = 256, grid = blocks)
+    k.out
+
+# ── Kernel: 1D convolution (same-padding, general stride) ───────────────────
+# Grid: ceil(t_out * c_out / 256).  Block: 256 threads.
+# Handles both the encoder's stride-1 (conv1) and stride-2 (conv2) layers.
+
+kernel Conv1dKernel:
+    let [float]'global   x        # (t_in × c_in)
+    let [float]'global   w        # (c_out × c_in × k)
+    let [float]'global   bv       # (c_out,)
+    mut [float]'unified  out      # (t_out × c_out)
+    let int              t_in
+    let int              c_in
+    let int              c_out
+    let int              k
+    let int              stride
+    let int              t_out
+
+    init([float]'global xi, [float]'global wi, [float]'global bi,
+         int ti, int ci, int co, int kk, int st, int to):
+        x      = xi
+        w      = wi
+        bv     = bi
+        t_in   = ti
+        c_in   = ci
+        c_out  = co
+        k      = kk
+        stride = st
+        t_out  = to
+        out    = [0.0 for ..to * co]
+
+    def ():
+        let cell = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        if cell < t_out * c_out:
+            let i    = cell / c_out
+            let oc   = cell % c_out
+            let pad  = k / 2
+            let src0 = i * stride
+            var float s = bv[oc]
+            for ic in 0..c_in:
+                for ki in 0..k:
+                    let si = src0 + ki - pad
+                    if si >= 0 and si < t_in:
+                        s += x[si * c_in + ic] * w[oc * c_in * k + ic * k + ki]
+            out[cell] = s
+
+pub req [float]'gpu'unified conv1d_gpu([float] x, [float] w, [float] bv,
+                       int t_in, int c_in, int c_out, int k,
+                       int stride, int t_out) throws:
+    let int n_cells = t_out * c_out
+    let int blocks  = (n_cells + 255) / 256
+    mut kk = Conv1dKernel(x, w, bv, t_in, c_in, c_out, k, stride, t_out)
+    kernel:
+        kk(block = 256, grid = blocks)
+    kk.out

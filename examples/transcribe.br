@@ -1,0 +1,24 @@
+# examples/transcribe.br — end-to-end transcription demo
+#
+# Run with:  boring run examples/transcribe.br
+
+use src.model
+use src.audio
+use src.math
+
+# Smoke-test: build a mel spectrogram from a synthetic 1-second sine wave
+# at 440 Hz and verify the shape, without requiring real weights.
+def main() throws:
+    let int n = SAMPLE_RATE                       # 16 000 samples = 1 second
+    var [float] sine = []
+    for i in 0..n:
+        sine.push((2.0 * PI * 440.0 * float(i) / float(SAMPLE_RATE)).sin())
+
+    let MelSpectrogram mel = log_mel_spectrogram(sine)
+    print "mel shape: {mel.n_mels} × {mel.n_frames}"   # expect 80 × 3000
+
+    # Full transcription (requires weights)
+    # let Whisper w    = load_whisper("weights/base.wbrf", "weights/tokenizer", ModelSize.Base)
+    # let string text  = w.transcribe("audio.wav")
+    # print text
+    print "done — uncomment the lines above once weights are available"

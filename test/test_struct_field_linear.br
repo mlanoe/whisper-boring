@@ -1,0 +1,59 @@
+# Isolates whether passing a STRUCT FIELD array (self.w) as an argument to a
+# free function requiring blocks > 1 dispatch (linear_gpu with d_out > 256)
+# behaves differently than passing a plain local `let` array — the earlier
+# decoder-level KV-cache test only ever exercised self.tok_emb at N_VOCAB=15
+# (blocks=1), never at real vocab scale (blocks=203).
+use io
+use math
+use math_gpu
+
+let int D_IN  = 384
+let int D_OUT = 51865
+
+pub req [float] mk(int n, float scale, float bias):
+    var [float] out = []
+    for i in 0..n:
+        out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
+    out
+
+struct Holder:
+    [float] w
+
+    req [float] project([float] x, int d_in, int d_out) throws:
+        linear_gpu(x, self.w, zeros(d_out), 1, d_in, d_out)
+
+def main() throws:
+    print "=== struct-field-array linear_gpu (blocks > 1) correctness ==="
+
+    let [float] x = mk(D_IN, 0.3, 0.1)
+    let [float] w = mk(D_IN * D_OUT, 0.2, 0.1)
+
+    # linear_gpu now expects its weight pre-transposed (see its doc comment).
+    let [float] w_t = transpose_flat(w, D_OUT, D_IN)
+    let Holder h = Holder(w = w_t.clone())
+    let [float] gpu_out = h.project(x, D_IN, D_OUT)
+
+    var [float] cpu_out = []
+    for o in 0..D_OUT:
+        var float acc = 0.0
+        for i in 0..D_IN:
+            acc += x[i] * w[o * D_IN + i]
+        cpu_out.push(acc)
+
+    var float max_diff = 0.0
+    var int worst = 0
+    var int o = 0
+    while o < D_OUT:
+        let dd = if cpu_out[o] > gpu_out[o]: cpu_out[o] - gpu_out[o] else: gpu_out[o] - cpu_out[o]
+        if dd > max_diff:
+            max_diff = dd
+            worst = o
+        o += 1
+
+    print "gpu_out[0]={gpu_out[0]:.6f} cpu_out[0]={cpu_out[0]:.6f}"
+    print "gpu_out[57]={gpu_out[57]:.6f} cpu_out[57]={cpu_out[57]:.6f}"
+    print "gpu_out[1000]={gpu_out[1000]:.6f} cpu_out[1000]={cpu_out[1000]:.6f}"
+    print "gpu_out[25000]={gpu_out[25000]:.6f} cpu_out[25000]={cpu_out[25000]:.6f}"
+    print "gpu_out[49999]={gpu_out[49999]:.6f} cpu_out[49999]={cpu_out[49999]:.6f}"
+    print "gpu_out[51864]={gpu_out[51864]:.6f} cpu_out[51864]={cpu_out[51864]:.6f}"
+    print "max diff = {max_diff:.8f} at index {worst}"

@@ -1,0 +1,70 @@
+# test/test_audio.br — test load_wav and log_mel_spectrogram
+#
+# Run from the whisper-boring root:
+#   cargo run --manifest-path ../boring/Cargo.toml -- run test/test_audio.br
+
+use io
+use audio
+
+def main() throws:
+    let string wav_path = "test/sine440.wav"
+
+    # ── Test raw byte reading ────────────────────────────────────────────────
+    let [uint8] bytes = fs.readBytes(wav_path)
+    print "File size: {bytes.length} bytes"
+
+    # Validate RIFF header (R=82 I=73 F=70 F=70)
+    let int b0 = int(bytes[0])
+    let int b1 = int(bytes[1])
+    let int b2 = int(bytes[2])
+    let int b3 = int(bytes[3])
+    print "Header: {b0} {b1} {b2} {b3}  (expect 82 73 70 70 = RIFF)"
+
+    let int sr = read_u32_le(bytes, 24)
+    let int ch = read_u16_le(bytes, 22)
+    let int bps = read_u16_le(bytes, 34)
+    print "Sample rate: {sr} Hz  channels: {ch}  bits: {bps}"
+
+    # ── Test load_wav ────────────────────────────────────────────────────────
+    print ""
+    print "Loading WAV..."
+    let [float] samples = load_wav(wav_path)
+    print "Samples loaded: {samples.length}"
+
+    let float s0 = samples[0]
+    let float s100 = samples[100]
+    let float s1000 = samples[1000]
+    print "samples[0]    = {s0:.6f}"
+    print "samples[100]  = {s100:.6f}"
+    print "samples[1000] = {s1000:.6f}"
+
+    # Check range [-1, 1]
+    var float vmin = samples[0]
+    var float vmax = samples[0]
+    for s in samples:
+        if s < vmin: vmin = s
+        if s > vmax: vmax = s
+    print "min={vmin:.4f}  max={vmax:.4f}  (expect ~[-1, 1])"
+
+    # ── Test mel spectrogram ─────────────────────────────────────────────────
+    print ""
+    print "Computing mel spectrogram..."
+    let MelSpectrogram mel = log_mel_spectrogram(samples)
+    print "Mel frames: {mel.n_frames}  mels: {mel.n_mels}"
+    print "data length: {mel.data.length}  (expect {mel.n_frames * mel.n_mels})"
+
+    # Print a few values from the first frame
+    let float m0 = mel.data[0]
+    let float m1 = mel.data[1]
+    let float m2 = mel.data[2]
+    print "mel[0,0]={m0:.4f}  mel[0,1]={m1:.4f}  mel[0,2]={m2:.4f}"
+
+    var float mmin = mel.data[0]
+    var float mmax = mel.data[0]
+    for v in mel.data:
+        if v < mmin: mmin = v
+        if v > mmax: mmax = v
+    print "mel range: [{mmin:.4f}, {mmax:.4f}]  (expect ~[-1, 1])"
+
+    print ""
+    print "All tests passed."

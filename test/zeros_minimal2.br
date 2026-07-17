@@ -1,0 +1,7 @@
+use math
+
+def main():
+    let int p = next_pow2(10)
+    print "{p}"
+    let [float] fb = zeros(5)
+    print "{fb.length}"
