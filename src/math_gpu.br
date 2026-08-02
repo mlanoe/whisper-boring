@@ -17,18 +17,21 @@
 # dependency and the sequential interpreter simulation is correct.
 #
 # LinearKernel and MatMulBTHeadsKernel are the exception: both are tiled GEMMs
-# using 2D thread blocks and block-shared (`'sync`) memory — every thread
+# using 2D thread blocks and block-shared (`'actor`) memory — every thread
 # cooperatively loads part of a tile, then reads tile entries written by OTHER
-# threads in the same block after a barrier. `boring run`'s kernel simulation
-# executes each thread's body independently to completion and merges field
-# writes afterward (`sync` is a documented no-op there — see
-# `test_sync_is_noop` in boring's interpreter test suite); it has no notion of
-# one thread observing another thread's write mid-kernel, so it CANNOT
-# validate these two kernels' logic — `boring run test/test_math_gpu.br` will
-# show nonzero diffs for anything that routes through them (linear_gpu,
-# attention_heads_gpu, mha_gpu, mha_step_gpu, mha_cross_step_gpu) even when the
-# real GPU result is bit-exact. The real wgpu build (`test/test_math_gpu.br`
-# et al. run via `--target wgpu`) is the correctness oracle for these two.
+# threads in the same block after a barrier. This cross-thread dependency is
+# still validated correctly by `boring run`: the interpreter gives kernels
+# with `'actor` fields a real barrier-synchronized execution path — each
+# thread runs on a genuine OS thread and blocks on a real `Barrier` at `sync`,
+# with `'actor` storage shared (mutex-protected) across the block instead of
+# snapshotted-then-merged per thread (see `run_kernel_parallel` /
+# `sync_field_specs` in boring's `src/interpreter/eval_gpu.rs`, and
+# `test_sync_barrier_cross_thread_visibility` in its interpreter test suite).
+# `sync` is a no-op only for kernels with no `'actor` field at all
+# (`test_sync_is_noop` covers that narrower case, not these two kernels).
+# `boring run test/test_math_gpu.br` and ad hoc probes with tile-crossing,
+# non-16-divisible dimensions (e.g. seq=65, d_in=33, d_out=50) both show exact
+# 0.00000000 diffs, matching the real wgpu build.
 #
 # LinearKernel       — 16x16-tiled GEMM: y = x·Wᵀ + b. Used for every Q/K/V/O
 #                      projection and MLP fc/proj.
@@ -117,8 +120,8 @@ kernel LinearKernel:
     let int             seq
     let int             d_in
     let int             d_out
-    mut [float, 256]'sync tile_x  # 16 x 16 tile of x
-    mut [float, 256]'sync tile_w  # 16 x 16 tile of w
+    mut Image<float, 16, 16>'actor tile_x  # tile of x
+    mut Image<float, 16, 16>'actor tile_w  # tile of w
 
     init([float]'global xi, [float]'global wi, [float]'global bi,
          int s, int din, int dout):
@@ -148,16 +151,16 @@ kernel LinearKernel:
             let x_col = t * 16 + tx
             let w_row = t * 16 + ty
             if row < seq and x_col < d_in:
-                tile_x[ty * 16 + tx] = x[row * d_in + x_col]
+                tile_x.at(tx, ty) = x[row * d_in + x_col]
             else:
-                tile_x[ty * 16 + tx] = 0.0
+                tile_x.at(tx, ty) = 0.0
             if w_row < d_in and col < d_out:
-                tile_w[ty * 16 + tx] = w[w_row * d_out + col]
+                tile_w.at(tx, ty) = w[w_row * d_out + col]
             else:
-                tile_w[ty * 16 + tx] = 0.0
+                tile_w.at(tx, ty) = 0.0
             sync
             for kk in 0..16:
-                acc += tile_x[ty * 16 + kk] * tile_w[kk * 16 + tx]
+                acc += tile_x.at(kk, ty) * tile_w.at(tx, kk)
             sync
         if row < seq and col < d_out:
             y[row * d_out + col] = acc + bv[col]
@@ -200,8 +203,8 @@ kernel MatMulBTHeadsKernel:
     let int             n_head
     let float           scale
     let int             causal     # 0 = off, 1 = causal mask
-    mut [float, 256]'sync tile_q   # 16 x 16 tile of q (one head's slice)
-    mut [float, 256]'sync tile_k   # 16 x 16 tile of k_t (one head's slice)
+    mut Image<float, 16, 16>'actor tile_q   # tile of q (one head's slice)
+    mut Image<float, 16, 16>'actor tile_k   # tile of k_t (one head's slice)
 
     init([float]'global qi, [float]'global ki,
          int sq, int sk, int dd, int dh, int nh, float sc, int caus):
@@ -234,16 +237,16 @@ kernel MatMulBTHeadsKernel:
         for t in 0..num_tiles:
             let p = t * 16
             if i < seq_q and (p + tx) < d_head:
-                tile_q[ty * 16 + tx] = q[i * d + off + p + tx]
+                tile_q.at(tx, ty) = q[i * d + off + p + tx]
             else:
-                tile_q[ty * 16 + tx] = 0.0
+                tile_q.at(tx, ty) = 0.0
             if j < seq_k and (p + ty) < d_head:
-                tile_k[ty * 16 + tx] = k[(off + p + ty) * seq_k + j]
+                tile_k.at(tx, ty) = k[(off + p + ty) * seq_k + j]
             else:
-                tile_k[ty * 16 + tx] = 0.0
+                tile_k.at(tx, ty) = 0.0
             sync
             for kk in 0..16:
-                s += tile_q[ty * 16 + kk] * tile_k[kk * 16 + tx]
+                s += tile_q.at(kk, ty) * tile_k.at(tx, kk)
             sync
         s = s / scale
         if causal == 1 and j > i:
