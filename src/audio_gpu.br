@@ -36,26 +36,22 @@ use audio
 kernel StftPower:
     let [float]'global  audio      # reflect-padded audio
     let [float]'global  win        # Hann window (n_fft values)
-    mut [float]'unified power      # output: n_frames × n_freq power values
-    let int             n_frames
+    mut Image<float>'unified power # output: n_frames × n_freq power values
     let int             hop
     let int             n_padded
     let int             n_fft
-    let int             n_freq
 
     init([float]'global a, [float]'global w, int nf, int h, int np, int nfft, int nfreq):
         audio    = a
         win      = w
-        n_frames = nf
         hop      = h
         n_padded = np
         n_fft    = nfft
-        n_freq   = nfreq
-        power    = [0.0 for ..nf * nfreq]
+        power    = Image(nfreq, nf)
 
     def ():
         let frame = gpu.thread.x + gpu.block.x * gpu.block_dim.x
-        if frame < n_frames:
+        if frame < power.height():
             let start = frame * hop
 
             # Windowed samples for this frame
@@ -73,15 +69,14 @@ kernel StftPower:
                 sin_tab.push(ang.sin())
 
             # Direct DFT: one-sided power spectrum (n_freq bins)
-            let base = frame * n_freq
-            for k in 0..n_freq:
+            for k in 0..power.width():
                 var float re = 0.0
                 var float im = 0.0
                 for i in 0..n_fft:
                     let idx = (k * i) % n_fft
                     re += x[i] * cos_tab[idx]
                     im += x[i] * sin_tab[idx]
-                power[base + k] = re * re + im * im
+                power.at(k, frame) = re * re + im * im
 
 
 # ── Kernel 2: Mel filterbank dot-product ──────────────────────────────────────
@@ -97,29 +92,23 @@ kernel StftPower:
 # workgroups across SMs regardless of granularity.
 
 kernel MelApply:
-    let [float]'global  fb        # filterbank: n_mels × n_freq  (80 × 201)
-    let [float]'global  power     # STFT power:  n_frames × n_freq
-    mut [float]'unified mel       # output: n_mels × n_frames
-    let int             n_mels
-    let int             n_frames
-    let int             n_freq
+    let Image<float>'global  fb    # filterbank: n_mels × n_freq  (80 × 201)
+    let Image<float>'global  power # STFT power:  n_frames × n_freq
+    mut Image<float>'unified mel   # output: n_mels × n_frames
 
     init([float]'global f, [float]'global p, int nm, int nf, int nfq):
-        fb       = f
-        power    = p
-        mel      = [0.0 for ..nm * nf]
-        n_mels   = nm
-        n_frames = nf
-        n_freq   = nfq
+        fb    = Image(f, nfq, nm)
+        power = Image(p, nfq, nf)
+        mel   = Image(nf, nm)
 
     def ():
         let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
-        if f < n_frames:
-            for m in 0..n_mels:
+        if f < mel.width():
+            for m in 0..mel.height():
                 var float s = 0.0
-                for k in 0..n_freq:
-                    s += fb[m * n_freq + k] * power[f * n_freq + k]
-                mel[m * n_frames + f] = s
+                for k in 0..fb.width():
+                    s += fb.at(k, m) * power.at(k, f)
+                mel.at(f, m) = s
 
 
 # ── Kernel 3: Log compression ─────────────────────────────────────────────────
@@ -128,26 +117,21 @@ kernel MelApply:
 # Same granularity rationale as MelApply above.
 
 kernel LogCompress:
-    let [float]'global  mel_in
-    mut [float]'unified mel_out
-    let float           clamp_val
-    let int             n_mels
-    let int             n_frames
+    let Image<float>'global  mel_in
+    mut Image<float>'unified mel_out
+    let float                clamp_val
 
     init([float]'global inp, float cv, int nm, int nf):
-        mel_in    = inp
-        mel_out   = [0.0 for ..nm * nf]
+        mel_in    = Image(inp, nf, nm)
+        mel_out   = Image(nf, nm)
         clamp_val = cv
-        n_mels    = nm
-        n_frames  = nf
 
     def ():
         let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
-        if f < n_frames:
-            for m in 0..n_mels:
-                let i = m * n_frames + f
-                let v = if mel_in[i] > clamp_val: mel_in[i] else: clamp_val
-                mel_out[i] = v.log10()
+        if f < mel_in.width():
+            for m in 0..mel_in.height():
+                let v = if mel_in.at(f, m) > clamp_val: mel_in.at(f, m) else: clamp_val
+                mel_out.at(f, m) = v.log10()
 
 
 # ── GPU log-mel spectrogram ───────────────────────────────────────────────────

@@ -61,16 +61,12 @@ use math
 # it feeds) makes the hot loop's second-operand read contiguous across threads.
 
 kernel TransposeKernel:
-    let [float]'global   src      # (rows × cols)
-    mut [float]'unified  dst      # output: (cols × rows)
-    let int              rows
-    let int              cols
+    let Image<float>'global   src      # (rows × cols)
+    mut Image<float>'unified  dst      # output: (cols × rows)
 
-    init([float]'global s, int r, int c):
-        src  = s
-        rows = r
-        cols = c
-        dst  = [0.0 for ..r * c]
+    init([float]'global s, int rows, int cols):
+        src = Image(s, cols, rows)
+        dst = Image(rows, cols)
 
     def ():
         # 2D grid (see `transpose_gpu`): a single dispatch dimension caps out at
@@ -79,10 +75,10 @@ kernel TransposeKernel:
         # into one flat block index via grid_dim.x before recovering the cell.
         let block_idx = gpu.block.x + gpu.block.y * gpu.grid_dim.x
         let cell = gpu.thread.x + block_idx * gpu.block_dim.x
-        if cell < rows * cols:
-            let i = cell / cols
-            let j = cell % cols
-            dst[j * rows + i] = src[cell]
+        if cell < src.width() * src.height():
+            let i = cell / src.width()
+            let j = cell % src.width()
+            dst.at(i, j) = src.at(j, i)
 
 pub req [float]'gpu'unified transpose_gpu([float] src, int rows, int cols) throws:
     let int n_cells = rows * cols
