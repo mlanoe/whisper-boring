@@ -11,6 +11,7 @@ examples/*_wgpu/
 *_cuda/
 *_metal/
 *_wgpu/
+*_rocm/
 /wgpu_test/
 Cargo.lock
 .claude/worktrees/
