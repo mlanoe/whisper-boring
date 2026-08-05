@@ -23,6 +23,11 @@
 #              dot-product, fully parallel, no inter-thread dependency.
 #
 # LogCompress — one thread per element.  Element-wise log₁₀ with clamp.
+#
+# Buffer shapes use labeled multi-dim arrays (docs/array-multidim-types.md)
+# instead of Image<T> — every index reads its own axis name (`freq`/`frame`/
+# `mel`) directly, instead of a positional `.at(c, r)` whose meaning depended
+# on remembering which of `c`/`r` was which.
 
 use math
 use audio
@@ -36,7 +41,7 @@ use audio
 kernel StftPower:
     let [float]'global  audio      # reflect-padded audio
     let [float]'global  win        # Hann window (n_fft values)
-    mut Image<float>'unified power # output: n_frames × n_freq power values
+    mut [float, freq, frame]'unified power # output: n_freq × n_frames power values
     let int             hop
     let int             n_padded
     let int             n_fft
@@ -47,11 +52,11 @@ kernel StftPower:
         hop      = h
         n_padded = np
         n_fft    = nfft
-        power    = Image(nfreq, nf)
+        power    = [0.0 for freq = nfreq, frame = nf]
 
     def ():
         let frame = gpu.thread.x + gpu.block.x * gpu.block_dim.x
-        if frame < power.height():
+        if frame < power.size(.frame):
             let start = frame * hop
 
             # Windowed samples for this frame
@@ -69,20 +74,20 @@ kernel StftPower:
                 sin_tab.push(ang.sin())
 
             # Direct DFT: one-sided power spectrum (n_freq bins)
-            for k in 0..power.width():
+            for k in 0..power.size(.freq):
                 var float re = 0.0
                 var float im = 0.0
                 for i in 0..n_fft:
                     let idx = (k * i) % n_fft
                     re += x[i] * cos_tab[idx]
                     im += x[i] * sin_tab[idx]
-                power.at(k, frame) = re * re + im * im
+                power[freq = k, frame = frame] = re * re + im * im
 
 
 # ── Kernel 2: Mel filterbank dot-product ──────────────────────────────────────
 # Grid: ceil(n_frames / 256) blocks.   Block: 256 threads.
 # One thread per STFT frame.  Each thread computes ALL mel bands for its frame,
-# writing mel[m * n_frames + f] for m in 0..n_mels (non-overlapping across threads).
+# writing mel[frame=f, mel=m] for m in 0..n_mels (non-overlapping across threads).
 #
 # Why "one thread per frame" rather than "one thread per (m, f) cell" ?
 # The parallel interpreter (rayon) creates one Interpreter per thread.
@@ -92,23 +97,23 @@ kernel StftPower:
 # workgroups across SMs regardless of granularity.
 
 kernel MelApply:
-    let Image<float>'global  fb    # filterbank: n_mels × n_freq  (80 × 201)
-    let Image<float>'global  power # STFT power:  n_frames × n_freq
-    mut Image<float>'unified mel   # output: n_mels × n_frames
+    let [float, freq, mel]'global   fb    # filterbank: n_freq × n_mels  (201 × 80)
+    let [float, freq, frame]'global power # STFT power:  n_freq × n_frames
+    mut [float, frame, mel]'unified mel   # output: n_frames × n_mels
 
     init([float]'global f, [float]'global p, int nm, int nf, int nfq):
-        fb    = Image(f, nfq, nm)
-        power = Image(p, nfq, nf)
-        mel   = Image(nf, nm)
+        fb    = f.reshape(freq = nfq, mel = nm)
+        power = p.reshape(freq = nfq, frame = nf)
+        mel   = [0.0 for frame = nf, mel = nm]
 
     def ():
         let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
-        if f < mel.width():
-            for m in 0..mel.height():
+        if f < mel.size(.frame):
+            for m in 0..mel.size(.mel):
                 var float s = 0.0
-                for k in 0..fb.width():
-                    s += fb.at(k, m) * power.at(k, f)
-                mel.at(f, m) = s
+                for k in 0..fb.size(.freq):
+                    s += fb[freq = k, mel = m] * power[freq = k, frame = f]
+                mel[frame = f, mel = m] = s
 
 
 # ── Kernel 3: Log compression ─────────────────────────────────────────────────
@@ -117,21 +122,21 @@ kernel MelApply:
 # Same granularity rationale as MelApply above.
 
 kernel LogCompress:
-    let Image<float>'global  mel_in
-    mut Image<float>'unified mel_out
-    let float                clamp_val
+    let [float, frame, mel]'global  mel_in
+    mut [float, frame, mel]'unified mel_out
+    let float                       clamp_val
 
     init([float]'global inp, float cv, int nm, int nf):
-        mel_in    = Image(inp, nf, nm)
-        mel_out   = Image(nf, nm)
+        mel_in    = inp.reshape(frame = nf, mel = nm)
+        mel_out   = [0.0 for frame = nf, mel = nm]
         clamp_val = cv
 
     def ():
         let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
-        if f < mel_in.width():
-            for m in 0..mel_in.height():
-                let v = if mel_in.at(f, m) > clamp_val: mel_in.at(f, m) else: clamp_val
-                mel_out.at(f, m) = v.log10()
+        if f < mel_in.size(.frame):
+            for m in 0..mel_in.size(.mel):
+                let v = if mel_in[frame = f, mel = m] > clamp_val: mel_in[frame = f, mel = m] else: clamp_val
+                mel_out[frame = f, mel = m] = v.log10()
 
 
 # ── GPU log-mel spectrogram ───────────────────────────────────────────────────
