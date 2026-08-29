@@ -18,6 +18,8 @@ ModelSize size_from_str(string s):
         _:        ModelSize.Base
 
 def main() throws:
+    # argv[0] convention: args()[0] is this binary's own invoked path, not a
+    # user argument -- start parsing at index 1.
     let [string] argv = args()
 
     var string audio_path    = "test/test10s.wav"
@@ -26,7 +28,7 @@ def main() throws:
     var string tokenizer_dir = "weights/tokenizer"
 
     var bool have_audio = false
-    var int i = 0
+    var int i = 1
     while i < argv.length:
         let string a = argv[i]
         if a == "--model" and i + 1 < argv.length:
