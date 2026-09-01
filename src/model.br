@@ -44,7 +44,7 @@ struct ModelConfig:
 struct Whisper:
     ModelConfig  config
     AudioEncoder encoder
-    var TextDecoder decoder
+    mut TextDecoder decoder
     Tokenizer    tokenizer
 
     # Full transcription pipeline: audio path → transcript string.

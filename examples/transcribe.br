@@ -1,10 +1,24 @@
 # examples/transcribe.br — end-to-end transcription demo
 #
 # Run with:  boring run examples/transcribe.br
-
-use src.model
-use src.audio
-use src.math
+#
+# `use src.model`/`use src.audio`/`use src.math` (the dotted cross-directory
+# form) never actually resolves from a file outside src/ under `boring run`
+# -- switched to the bare same-project sibling-file form instead (`use
+# model`, works via the project src/ fallback search path).
+#
+# Import ORDER matters here, and not just cosmetically: `audio`/`math` must
+# come before `model` (which itself does `use audio` transitively). Loading
+# `model` first, then directly `use audio` again, silently drops `audio.br`'s
+# own top-level `let` constants (SAMPLE_RATE, N_MELS, ...) from this file's
+# scope -- pub functions/structs from a transitively-then-directly-loaded
+# sibling survive fine, only top-level `let` constants don't, and only when
+# the transitive load comes first. Real `boring` interpreter bug, filed
+# upstream (see this project's own commit history for the task id) --
+# revert to whatever import order reads best once that's fixed.
+use audio
+use math
+use model
 
 # Smoke-test: build a mel spectrogram from a synthetic 1-second sine wave
 # at 440 Hz and verify the shape, without requiring real weights.

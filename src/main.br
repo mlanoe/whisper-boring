@@ -52,7 +52,7 @@ def main() throws:
     let ModelSize size = size_from_str(model_name)
 
     print "[diag] loading weights from {weights_path}..."
-    var Whisper w   = load_whisper(weights_path, tokenizer_dir, size)
+    mut Whisper w   = load_whisper(weights_path, tokenizer_dir, size)
     print "[diag] weights loaded"
     let string text = w.transcribe(audio_path)
     print text

@@ -8,7 +8,24 @@ The goal is a clean, readable implementation that produces fast, native Rust cod
 
 ## Status
 
-Work in progress. The project structure is in place; the model implementation is the next step.
+The full pipeline — WAV loading, log-mel spectrogram, encoder, decoder with
+KV-cache, greedy decoding, tokenizer — is implemented and runs end-to-end.
+`boring build --target metal` (Apple Silicon/macOS) compiles cleanly and
+produces correct transcriptions against real OpenAI Whisper weights (`base`
+model verified against a real speech sample). CUDA, ROCm, and wgpu targets
+share the same `src/*.br` source (GPU kernels are written once, per the
+Metal backend doc's `'unified`/`'sync`/`'gpu` qualifiers) but are unverified
+on this project specifically — Metal is the actively-tested backend so far,
+matching the project's own "compare against reference Whisper" benchmark
+goal (`CLAUDE.md`).
+
+The plain `std` target (`boring build`, no `--target`) does **not** build —
+this project's GPU-callable kernels have no CPU-only host codegen path in
+`boring` today (a real compiler gap, filed upstream). Use `--target metal`
+(or another GPU target) instead.
+
+Benchmarking against Python/PyTorch reference Whisper (this project's
+stated end goal) hasn't started yet.
 
 ---
 
@@ -40,12 +57,21 @@ cargo install --git https://github.com/mlanoe/boring
 ## Run
 
 ```sh
-# Interpret directly
+# Smoke test (mel-spectrogram shape only, no weights needed)
 boring run examples/transcribe.br
 
-# Transpile to Rust
-boring build examples/transcribe.br
-cd examples/transcribe_rust && cargo run
+# Full transcription, transpiled to Rust + Metal (project mode, via boring.toml)
+boring build --target metal
+cd src/main_metal && cargo build
+./target/debug/main path/to/audio.wav --model base \
+    --weights weights/base.wbrf --tokenizer weights/tokenizer
+```
+
+Model weights aren't tracked by git — export them from the real
+`openai-whisper` package first:
+
+```sh
+python tools/export_weights.py --model base --out weights/base.wbrf
 ```
 
 ---

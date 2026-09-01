@@ -10,11 +10,11 @@
 use math
 use io
 
-let int SAMPLE_RATE = 16000
-let int N_FFT       = 400
-let int HOP_LENGTH  = 160
-let int N_MELS      = 80
-let int N_FRAMES    = 3000
+pub let int SAMPLE_RATE = 16000
+pub let int N_FFT       = 400
+pub let int HOP_LENGTH  = 160
+pub let int N_MELS      = 80
+pub let int N_FRAMES    = 3000
 
 struct MelSpectrogram:
     int     n_frames
