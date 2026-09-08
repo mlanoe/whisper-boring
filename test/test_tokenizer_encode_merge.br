@@ -1,0 +1,17 @@
+# test/test_tokenizer_encode_merge.br — regression test for encode()'s BPE
+# merge bug: every character used to start in its own single-element "word",
+# so apply_merge (which only looks at adjacent pairs *within* one word) could
+# never find anything to merge, regardless of merges.txt.
+use tokenizer
+
+def main() throws:
+    let Tokenizer tok = load_tokenizer("test/tokenizer_bpe")
+
+    # "ab" is two adjacent chars covered by the single merge rule "a b",
+    # and "ab" itself is in the vocab. A correct BPE merge must produce
+    # exactly one token (id 12), not two separate "a"/"b" tokens (10, 11).
+    let [int] ids = tok.encode("ab")
+    print "encode(ab) = {ids}  (expect [12], a single merged token)"
+    guard ids.length == 1 and ids[0] == 12 else throw "BPE merge did not happen: got {ids}"
+
+    print "Tokenizer encode merge test passed."

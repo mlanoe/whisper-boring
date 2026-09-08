@@ -28,12 +28,15 @@ struct Tokenizer:
 
     req [int] encode(string text):
         # 1. Convert text to a sequence of single-byte tokens (UTF-8 bytes
-        #    mapped to their byte-level representation in the vocab).
-        var [[string]] words = []
+        #    mapped to their byte-level representation in the vocab), all
+        #    kept in a single "word" so the merge loop below can actually
+        #    find adjacent pairs — apply_merge only ever looks at pairs
+        #    inside one word, and a merge can't happen across a one-element
+        #    word boundary.
+        var [string] chars = []
         for ch in text.chars():
-            var [string] chars = []
             chars.push("{ch}")
-            words.push(chars)
+        var [[string]] words = [chars]
 
         # 2. Apply BPE merge rules in order.
         for merge in self.merges:
