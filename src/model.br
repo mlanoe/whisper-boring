@@ -75,16 +75,30 @@ struct Whisper:
 # Generate this file from the original PyTorch checkpoint with:
 #   python tools/export_weights.py --model base --out weights/base.wbrf
 
-Whisper load_whisper(string weights_path, string tokenizer_dir,
-                     ModelSize size) throws:
-    let ModelConfig cfg = ModelConfig.for_size(size)
+# Look up a required tensor by name, throwing a clear error instead of
+# panicking when a checkpoint is missing a tensor (model/config size
+# mismatch, or a truncated/corrupted .wbrf file).
+[float] get_tensor({string=[float]} tensors, string key) throws:
+    guard tensors.contains(key) else throw "missing tensor: {key}"
+    tensors[key]
 
-    # ── Parse WBRF binary ─────────────────────────────────────────────────────
-    let [uint8] bytes = fs.readBytes(weights_path)
-    guard bytes.length >= 8 else throw "WBRF file too short: {weights_path}"
+# Transpose a flat weight matrix after checking its element count matches
+# rows*cols — a mismatched size (corrupt file, wrong --model size) would
+# otherwise panic deep inside transpose_flat's row-major indexing instead
+# of surfacing a clear error through this function's `throws`.
+[float] checked_transpose([float] src, int rows, int cols, string name) throws:
+    guard src.length == rows * cols else throw "tensor '{name}' has {src.length} elements, expected {rows * cols} ({rows}x{cols})"
+    transpose_flat(src, rows, cols)
+
+# Parse a WBRF binary blob into its {name -> flat float data} tensor map.
+# Every multi-byte read is bounds-checked against bytes.length first, so a
+# truncated or corrupted .wbrf file throws a clear error here instead of
+# panicking mid-parse (e.g. cut off in the middle of a tensor's float data).
+pub {string=[float]} parse_wbrf_tensors([uint8] bytes) throws:
+    guard bytes.length >= 8 else throw "WBRF file too short"
 
     # Magic: "WBRF" = 0x57 0x42 0x52 0x46
-    guard int(bytes[0]) == 87 and int(bytes[1]) == 66 and int(bytes[2]) == 82 and int(bytes[3]) == 70 else throw "Not a WBRF file (bad magic): {weights_path}"
+    guard int(bytes[0]) == 87 and int(bytes[1]) == 66 and int(bytes[2]) == 82 and int(bytes[3]) == 70 else throw "Not a WBRF file (bad magic)"
 
     let int n_tensors = read_u32_le(bytes, 4)
     var {string=[float]} tensors = {=}
@@ -92,12 +106,16 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
     var int ti = 0
 
     while ti < n_tensors:
+        guard offset + 4 <= bytes.length else throw "WBRF truncated: missing name_len for tensor {ti} of {n_tensors}"
         let int name_len = read_u32_le(bytes, offset)
         offset += 4
+        guard offset + name_len <= bytes.length else throw "WBRF truncated: name for tensor {ti} runs past end of file"
         let string name = read_utf8(bytes, offset, name_len)
         offset += name_len
+        guard offset + 4 <= bytes.length else throw "WBRF truncated: missing n_elems for tensor '{name}'"
         let int n_elems = read_u32_le(bytes, offset)
         offset += 4
+        guard offset + 4 * n_elems <= bytes.length else throw "WBRF truncated: tensor '{name}' expects {n_elems} floats but file ends early"
 
         var [float] data = []
         var int ei = 0
@@ -108,6 +126,18 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
 
         tensors[name] = data
         ti += 1
+
+    tensors
+
+Whisper load_whisper(string weights_path, string tokenizer_dir,
+                     ModelSize size) throws:
+    let ModelConfig cfg = ModelConfig.for_size(size)
+
+    # ── Parse WBRF binary ─────────────────────────────────────────────────────
+    let [uint8] bytes = fs.readBytes(weights_path)
+    guard bytes.length >= 8 else throw "WBRF file too short: {weights_path}"
+
+    var {string=[float]} tensors = parse_wbrf_tensors(bytes)
 
     # ── Build AudioEncoder ────────────────────────────────────────────────────
     # Every `linear_gpu`-consumed weight matrix is transposed exactly once
@@ -120,33 +150,33 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
     while li < cfg.n_audio_layer:
         let string ep = "encoder.blocks.{li}"
         enc_blocks.push(EncoderBlock(
-            attn_q_w = transpose_flat(tensors["{ep}.attn_q.weight"], ad, ad),
-            attn_q_b = tensors["{ep}.attn_q.bias"],
-            attn_k_w = transpose_flat(tensors["{ep}.attn_k.weight"], ad, ad),
-            attn_v_w = transpose_flat(tensors["{ep}.attn_v.weight"], ad, ad),
-            attn_v_b = tensors["{ep}.attn_v.bias"],
-            attn_o_w = transpose_flat(tensors["{ep}.attn_o.weight"], ad, ad),
-            attn_o_b = tensors["{ep}.attn_o.bias"],
-            ln1_w    = tensors["{ep}.ln1.weight"],
-            ln1_b    = tensors["{ep}.ln1.bias"],
-            ln2_w    = tensors["{ep}.ln2.weight"],
-            ln2_b    = tensors["{ep}.ln2.bias"],
-            mlp_fc_w = transpose_flat(tensors["{ep}.mlp_fc.weight"], ad * 4, ad),
-            mlp_fc_b = tensors["{ep}.mlp_fc.bias"],
-            mlp_pr_w = transpose_flat(tensors["{ep}.mlp_pr.weight"], ad, ad * 4),
-            mlp_pr_b = tensors["{ep}.mlp_pr.bias"]
+            attn_q_w = checked_transpose(get_tensor(tensors, "{ep}.attn_q.weight"), ad, ad, "{ep}.attn_q.weight"),
+            attn_q_b = get_tensor(tensors, "{ep}.attn_q.bias"),
+            attn_k_w = checked_transpose(get_tensor(tensors, "{ep}.attn_k.weight"), ad, ad, "{ep}.attn_k.weight"),
+            attn_v_w = checked_transpose(get_tensor(tensors, "{ep}.attn_v.weight"), ad, ad, "{ep}.attn_v.weight"),
+            attn_v_b = get_tensor(tensors, "{ep}.attn_v.bias"),
+            attn_o_w = checked_transpose(get_tensor(tensors, "{ep}.attn_o.weight"), ad, ad, "{ep}.attn_o.weight"),
+            attn_o_b = get_tensor(tensors, "{ep}.attn_o.bias"),
+            ln1_w    = get_tensor(tensors, "{ep}.ln1.weight"),
+            ln1_b    = get_tensor(tensors, "{ep}.ln1.bias"),
+            ln2_w    = get_tensor(tensors, "{ep}.ln2.weight"),
+            ln2_b    = get_tensor(tensors, "{ep}.ln2.bias"),
+            mlp_fc_w = checked_transpose(get_tensor(tensors, "{ep}.mlp_fc.weight"), ad * 4, ad, "{ep}.mlp_fc.weight"),
+            mlp_fc_b = get_tensor(tensors, "{ep}.mlp_fc.bias"),
+            mlp_pr_w = checked_transpose(get_tensor(tensors, "{ep}.mlp_pr.weight"), ad, ad * 4, "{ep}.mlp_pr.weight"),
+            mlp_pr_b = get_tensor(tensors, "{ep}.mlp_pr.bias")
         ))
         li += 1
 
     let AudioEncoder enc = AudioEncoder(
-        conv1_w    = tensors["encoder.conv1.weight"],
-        conv1_b    = tensors["encoder.conv1.bias"],
-        conv2_w    = tensors["encoder.conv2.weight"],
-        conv2_b    = tensors["encoder.conv2.bias"],
-        pos_emb    = tensors["encoder.pos_emb"],
+        conv1_w    = get_tensor(tensors, "encoder.conv1.weight"),
+        conv1_b    = get_tensor(tensors, "encoder.conv1.bias"),
+        conv2_w    = get_tensor(tensors, "encoder.conv2.weight"),
+        conv2_b    = get_tensor(tensors, "encoder.conv2.bias"),
+        pos_emb    = get_tensor(tensors, "encoder.pos_emb"),
         blocks     = enc_blocks,
-        ln_w       = tensors["encoder.ln.weight"],
-        ln_b       = tensors["encoder.ln.bias"],
+        ln_w       = get_tensor(tensors, "encoder.ln.weight"),
+        ln_b       = get_tensor(tensors, "encoder.ln.bias"),
         n_head_val = cfg.n_audio_head
     )
 
@@ -157,30 +187,30 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
     while li < cfg.n_text_layer:
         let string dp = "decoder.blocks.{li}"
         dec_blocks.push(DecoderBlock(
-            sa_q_w   = transpose_flat(tensors["{dp}.sa_q.weight"], td, td),
-            sa_q_b   = tensors["{dp}.sa_q.bias"],
-            sa_k_w   = transpose_flat(tensors["{dp}.sa_k.weight"], td, td),
-            sa_v_w   = transpose_flat(tensors["{dp}.sa_v.weight"], td, td),
-            sa_v_b   = tensors["{dp}.sa_v.bias"],
-            sa_o_w   = transpose_flat(tensors["{dp}.sa_o.weight"], td, td),
-            sa_o_b   = tensors["{dp}.sa_o.bias"],
-            ln1_w    = tensors["{dp}.ln1.weight"],
-            ln1_b    = tensors["{dp}.ln1.bias"],
-            ca_q_w   = transpose_flat(tensors["{dp}.ca_q.weight"], td, td),
-            ca_q_b   = tensors["{dp}.ca_q.bias"],
-            ca_k_w   = transpose_flat(tensors["{dp}.ca_k.weight"], td, td),
-            ca_v_w   = transpose_flat(tensors["{dp}.ca_v.weight"], td, td),
-            ca_v_b   = tensors["{dp}.ca_v.bias"],
-            ca_o_w   = transpose_flat(tensors["{dp}.ca_o.weight"], td, td),
-            ca_o_b   = tensors["{dp}.ca_o.bias"],
-            ln2_w    = tensors["{dp}.ln2.weight"],
-            ln2_b    = tensors["{dp}.ln2.bias"],
-            mlp_fc_w = transpose_flat(tensors["{dp}.mlp_fc.weight"], td * 4, td),
-            mlp_fc_b = tensors["{dp}.mlp_fc.bias"],
-            mlp_pr_w = transpose_flat(tensors["{dp}.mlp_pr.weight"], td, td * 4),
-            mlp_pr_b = tensors["{dp}.mlp_pr.bias"],
-            ln3_w    = tensors["{dp}.ln3.weight"],
-            ln3_b    = tensors["{dp}.ln3.bias"],
+            sa_q_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_q.weight"), td, td, "{dp}.sa_q.weight"),
+            sa_q_b   = get_tensor(tensors, "{dp}.sa_q.bias"),
+            sa_k_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_k.weight"), td, td, "{dp}.sa_k.weight"),
+            sa_v_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_v.weight"), td, td, "{dp}.sa_v.weight"),
+            sa_v_b   = get_tensor(tensors, "{dp}.sa_v.bias"),
+            sa_o_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_o.weight"), td, td, "{dp}.sa_o.weight"),
+            sa_o_b   = get_tensor(tensors, "{dp}.sa_o.bias"),
+            ln1_w    = get_tensor(tensors, "{dp}.ln1.weight"),
+            ln1_b    = get_tensor(tensors, "{dp}.ln1.bias"),
+            ca_q_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_q.weight"), td, td, "{dp}.ca_q.weight"),
+            ca_q_b   = get_tensor(tensors, "{dp}.ca_q.bias"),
+            ca_k_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_k.weight"), td, td, "{dp}.ca_k.weight"),
+            ca_v_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_v.weight"), td, td, "{dp}.ca_v.weight"),
+            ca_v_b   = get_tensor(tensors, "{dp}.ca_v.bias"),
+            ca_o_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_o.weight"), td, td, "{dp}.ca_o.weight"),
+            ca_o_b   = get_tensor(tensors, "{dp}.ca_o.bias"),
+            ln2_w    = get_tensor(tensors, "{dp}.ln2.weight"),
+            ln2_b    = get_tensor(tensors, "{dp}.ln2.bias"),
+            mlp_fc_w = checked_transpose(get_tensor(tensors, "{dp}.mlp_fc.weight"), td * 4, td, "{dp}.mlp_fc.weight"),
+            mlp_fc_b = get_tensor(tensors, "{dp}.mlp_fc.bias"),
+            mlp_pr_w = checked_transpose(get_tensor(tensors, "{dp}.mlp_pr.weight"), td, td * 4, "{dp}.mlp_pr.weight"),
+            mlp_pr_b = get_tensor(tensors, "{dp}.mlp_pr.bias"),
+            ln3_w    = get_tensor(tensors, "{dp}.ln3.weight"),
+            ln3_b    = get_tensor(tensors, "{dp}.ln3.bias"),
             cache_sa_k = [],
             cache_sa_v = [],
             cache_ca_k = [],
@@ -190,12 +220,12 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
         li += 1
 
     let TextDecoder dec = TextDecoder(
-        tok_emb    = tensors["decoder.tok_emb"],
-        tok_emb_t  = transpose_flat(tensors["decoder.tok_emb"], cfg.n_vocab, td),
-        pos_emb    = tensors["decoder.pos_emb"],
+        tok_emb    = get_tensor(tensors, "decoder.tok_emb"),
+        tok_emb_t  = checked_transpose(get_tensor(tensors, "decoder.tok_emb"), cfg.n_vocab, td, "decoder.tok_emb"),
+        pos_emb    = get_tensor(tensors, "decoder.pos_emb"),
         blocks     = dec_blocks,
-        ln_w       = tensors["decoder.ln.weight"],
-        ln_b       = tensors["decoder.ln.bias"],
+        ln_w       = get_tensor(tensors, "decoder.ln.weight"),
+        ln_b       = get_tensor(tensors, "decoder.ln.bias"),
         n_head_val = cfg.n_text_head
     )
 

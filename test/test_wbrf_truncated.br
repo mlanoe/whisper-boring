@@ -1,0 +1,19 @@
+# test/test_wbrf_truncated.br — regression test for the WBRF parser's bounds
+# checking: a .wbrf file cut off mid-tensor must throw a clear error via
+# `throws`, not panic reading past the end of `bytes`.
+use io
+use model
+
+def main() throws:
+    let [uint8] good_bytes = fs.readBytes("test/tiny_test.wbrf")
+    let tensors = parse_wbrf_tensors(good_bytes)
+    print "good file: parsed {tensors.length} tensors  (expect 2)"
+
+    let [uint8] bad_bytes = fs.readBytes("test/truncated.wbrf")
+    try:
+        let bad_tensors = parse_wbrf_tensors(bad_bytes)
+        print "FAIL: expected a throw, got {bad_tensors.length} tensors"
+    catch:
+        print "truncated file: caught expected error: {error}"
+
+    print "WBRF truncated test passed."

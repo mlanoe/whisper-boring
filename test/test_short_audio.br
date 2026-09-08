@@ -1,5 +1,6 @@
 # test/test_short_audio.br — regression test for the "audio too short" panic
 # (log_mel_spectrogram indexing mel[0] on an empty mel array when n_frames == 0).
+use io
 use audio
 
 def main() throws:
@@ -28,5 +29,14 @@ def main() throws:
         ok_audio.push(0.0)
     let m3 = log_mel_spectrogram(ok_audio)
     print "ok_audio: n_frames={m3.n_frames} n_mels={m3.n_mels}  (expect 3000, 80)"
+
+    # End-to-end: a real (truncated) WAV file with only 10 samples of PCM
+    # data must fail the same way through the full load_wav → mel path.
+    let [float] wav_samples = load_wav("test/very_short.wav")
+    try:
+        let m4 = log_mel_spectrogram(wav_samples)
+        print "FAIL: expected a throw, got {m4.n_frames} frames"
+    catch:
+        print "very_short.wav: caught expected error: {error}"
 
     print "Short audio test passed."
