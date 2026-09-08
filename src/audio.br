@@ -159,6 +159,9 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
         mel[i] /= 4.0
 
     # Pad or trim to N_FRAMES columns
+    if n_frames > N_FRAMES:
+        let float total_secs = float(n_frames * HOP_LENGTH) / float(SAMPLE_RATE)
+        warn "audio is {total_secs:.1f}s, truncating to the first 30s (no windowed chunking yet)"
     var [float] fixed = zeros(N_MELS * N_FRAMES)
     let int cols = if n_frames < N_FRAMES: n_frames else: N_FRAMES
     for m in 0..N_MELS:

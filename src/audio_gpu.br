@@ -199,6 +199,9 @@ pub req MelSpectrogram log_mel_spectrogram_gpu([float] audio) throws:
     let float floor_ = log_max - 8.0
 
     # Pad or trim to N_FRAMES = 3000 columns
+    if n_frames > 3000:
+        let float total_secs = float(n_frames * hop) / float(SAMPLE_RATE)
+        warn "audio is {total_secs:.1f}s, truncating to the first 30s (no windowed chunking yet)"
     let int cols = if n_frames < 3000: n_frames else: 3000
     var [float] fixed = zeros(n_mels * 3000)
     for m in 0..n_mels:
