@@ -210,6 +210,7 @@ pub req [float] load_wav(string path) throws:
     guard audio_format == 1 else throw "Only PCM WAV supported (format={audio_format})"
     guard bits_per_smpl == 16 else throw "Only 16-bit WAV supported (bits={bits_per_smpl})"
     guard sample_rate == 16000 else throw "WAV must be 16 kHz (got {sample_rate} Hz) — resample before calling"
+    guard num_channels == 1 or num_channels == 2 else throw "unsupported channel count: {num_channels}"
 
     # Find the "data" sub-chunk (may not start at byte 36 if fmt is extended)
     var int data_offset = 12

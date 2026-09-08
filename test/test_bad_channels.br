@@ -1,0 +1,24 @@
+# test/test_bad_channels.br — regression test for the num_channels==0
+# infinite-loop bug in load_wav(): `i = i + 2 * num_channels` never advances
+# when num_channels is 0 (a corrupted fmt chunk), hanging forever. A channel
+# count of >= 3 was also silently misinterpreted rather than rejected.
+use audio
+
+def main() throws:
+    try:
+        let s0 = load_wav("test/bad_channels_0.wav")
+        print "FAIL: expected a throw, got {s0.length} samples"
+    catch:
+        print "num_channels=0: caught expected error: {error}"
+
+    try:
+        let s6 = load_wav("test/bad_channels_6.wav")
+        print "FAIL: expected a throw, got {s6.length} samples"
+    catch:
+        print "num_channels=6: caught expected error: {error}"
+
+    # Regression guard: the ordinary mono fixture must still load fine.
+    let ok = load_wav("test/tiny.wav")
+    print "tiny.wav: {ok.length} samples  (expect 200)"
+
+    print "Bad channels test passed."
