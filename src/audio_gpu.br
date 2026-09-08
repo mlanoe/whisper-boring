@@ -165,6 +165,7 @@ pub req MelSpectrogram log_mel_spectrogram_gpu([float] audio) throws:
     # Drop the last centered STFT frame, matching torch.stft(...)[..., :-1]
     # (see audio.br's stft_power for the same computation).
     let int n_frames = (n_padded - n_fft) / hop
+    guard n_frames > 0 else throw "audio too short (<10ms) for mel spectrogram"
 
     let [float] win = hann_window(n_fft)
     let [float] fb  = mel_filterbank(n_mels, n_fft, 16000)

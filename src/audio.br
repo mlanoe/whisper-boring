@@ -128,6 +128,7 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
 
     let [float] power = stft_power(audio, N_FFT, HOP_LENGTH)
     let int n_frames  = power.length / n_freq
+    guard n_frames > 0 else throw "audio too short (<10ms) for mel spectrogram"
 
     let [float] fb = mel_filterbank(N_MELS, N_FFT, SAMPLE_RATE)
 

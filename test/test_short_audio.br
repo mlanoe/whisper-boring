@@ -1,0 +1,32 @@
+# test/test_short_audio.br — regression test for the "audio too short" panic
+# (log_mel_spectrogram indexing mel[0] on an empty mel array when n_frames == 0).
+use audio
+
+def main() throws:
+    # 10 samples (< 160, one hop) can't produce even a single STFT frame.
+    var [float] short_audio = []
+    for _ in 0..10:
+        short_audio.push(0.0)
+
+    try:
+        let m = log_mel_spectrogram(short_audio)
+        print "FAIL: expected a throw, got {m.n_frames} frames"
+    catch:
+        print "short_audio: caught expected error: {error}"
+
+    # Fully empty audio too.
+    var [float] empty_audio = []
+    try:
+        let m2 = log_mel_spectrogram(empty_audio)
+        print "FAIL: expected a throw, got {m2.n_frames} frames"
+    catch:
+        print "empty_audio: caught expected error: {error}"
+
+    # Regression guard: a normal-length clip must still work fine.
+    var [float] ok_audio = []
+    for _ in 0..1000:
+        ok_audio.push(0.0)
+    let m3 = log_mel_spectrogram(ok_audio)
+    print "ok_audio: n_frames={m3.n_frames} n_mels={m3.n_mels}  (expect 3000, 80)"
+
+    print "Short audio test passed."
