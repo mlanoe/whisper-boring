@@ -127,7 +127,7 @@ kernel LinearKernel:
         seq   = s
         d_in  = din
         d_out = dout
-        y     = [0.0 for ..s * dout]
+        y     = [0.0 for ..<s * dout]
 
     # Standard 16x16-tiled GEMM: each thread owns one (row, col) output cell
     # and walks the d_in (reduction) dimension in 16-wide chunks, cooperatively
@@ -143,7 +143,7 @@ kernel LinearKernel:
         let col = gpu.block.x * gpu.block_dim.x + tx
         var float acc = 0.0
         let num_tiles = (d_in + 15) / 16
-        for t in 0..num_tiles:
+        for t in 0..<num_tiles:
             let x_col = t * 16 + tx
             let w_row = t * 16 + ty
             if row < seq and x_col < d_in:
@@ -155,7 +155,7 @@ kernel LinearKernel:
             else:
                 tile_w[width = tx, height = ty] = 0.0
             sync
-            for kk in 0..16:
+            for kk in 0..<16:
                 acc += tile_x[width = kk, height = ty] * tile_w[width = tx, height = kk]
             sync
         if row < seq and col < d_out:
@@ -228,7 +228,7 @@ kernel MatMulBTHeadsKernel:
         let off = h * d_head
         var float s = 0.0
         let num_tiles = (d_head + 15) / 16
-        for t in 0..num_tiles:
+        for t in 0..<num_tiles:
             let p = t * 16
             if i < seq_q and (p + tx) < d_head:
                 tile_q[width = tx, height = ty] = q[col = off + p + tx, row = i]
@@ -239,7 +239,7 @@ kernel MatMulBTHeadsKernel:
             else:
                 tile_k[width = tx, height = ty] = 0.0
             sync
-            for kk in 0..16:
+            for kk in 0..<16:
                 s += tile_q[width = kk, height = ty] * tile_k[width = tx, height = kk]
             sync
         s = s / scale
@@ -266,14 +266,14 @@ kernel SoftmaxRowsKernel:
         let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
         if i < probs.row:
             var float mx = scores_in[col = 0, row = i]
-            for j in 0..probs.col:
+            for j in 0..<probs.col:
                 if scores_in[col = j, row = i] > mx: mx = scores_in[col = j, row = i]
             var float total = 0.0
-            for j in 0..probs.col:
+            for j in 0..<probs.col:
                 let e = (scores_in[col = j, row = i] - mx).exp()
                 probs[col = j, row = i] = e
                 total += e
-            for j in 0..probs.col:
+            for j in 0..<probs.col:
                 probs[col = j, row = i] = probs[col = j, row = i] / total
 
 # ── Kernel: attention output, ALL HEADS in one dispatch (probs · V) ─────────
@@ -307,7 +307,7 @@ kernel MatMulHeadsKernel:
             let h   = col / d_head
             let jl  = col % d_head
             var float s = 0.0
-            for p in 0..v.row:
+            for p in 0..<v.row:
                 s += probs[p = p, i = i, h = h] * v[col = h * d_head + jl, row = p]
             c[col = col, row = i] = s
 
@@ -461,23 +461,23 @@ kernel LayerNormSeqKernel:
         bv  = bi
         seq = s
         d   = dd
-        out = [0.0 for ..s * dd]
+        out = [0.0 for ..<s * dd]
 
     def ():
         let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
         if i < seq:
             let base = i * d
             var float mu = 0.0
-            for j in 0..d:
+            for j in 0..<d:
                 mu += x[base + j]
             mu = mu / float(d)
             var float v = 0.0
-            for j in 0..d:
+            for j in 0..<d:
                 let diff = x[base + j] - mu
                 v += diff * diff
             v = v / float(d)
             let sd = (v + 1e-5).sqrt()
-            for j in 0..d:
+            for j in 0..<d:
                 out[base + j] = w[j] * (x[base + j] - mu) / sd + bv[j]
 
 pub req [float]'gpu'unified layer_norm_seq_gpu([float] x, [float] w, [float] b,
@@ -499,7 +499,7 @@ kernel GeluKernel:
     init([float]'global xi, int ni):
         x   = xi
         n   = ni
-        out = [0.0 for ..ni]
+        out = [0.0 for ..<ni]
 
     def ():
         let i = gpu.thread.x + gpu.block.x * gpu.block_dim.x
@@ -542,7 +542,7 @@ kernel Conv1dKernel:
         k      = kk
         stride = st
         t_out  = to
-        out    = [0.0 for ..to * co]
+        out    = [0.0 for ..<to * co]
 
     def ():
         let cell = gpu.thread.x + gpu.block.x * gpu.block_dim.x
@@ -552,8 +552,8 @@ kernel Conv1dKernel:
             let pad  = k / 2
             let src0 = i * stride
             var float s = bv[oc]
-            for ic in 0..c_in:
-                for ki in 0..k:
+            for ic in 0..<c_in:
+                for ki in 0..<k:
                     let si = src0 + ki - pad
                     if si >= 0 and si < t_in:
                         s += x[si * c_in + ic] * w[oc * c_in * k + ic * k + ki]

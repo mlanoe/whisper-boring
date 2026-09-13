@@ -7,7 +7,7 @@ def main() throws:
     # ── FFT correctness: DC signal ────────────────────────────────────────────
     print "Testing rfft_flat on DC signal..."
     var [float] dc = []
-    for _ in 0..16:
+    for _ in 0..<16:
         dc.push(1.0)
     let [float] dc_mag = rfft_flat(dc, 16)
     print "DC bin 0 = {dc_mag[0]:.1f}  (expect 16.0)"
@@ -48,10 +48,10 @@ def main() throws:
     # ── Mel application (skip full N_FRAMES padding for speed) ───────────────
     print "Applying mel filterbank..."
     var [float] mel_out = []
-    for m in 0..n_mels_val:
-        for f in 0..n_frames:
+    for m in 0..<n_mels_val:
+        for f in 0..<n_frames:
             var float s = 0.0
-            for k in 0..n_freq:
+            for k in 0..<n_freq:
                 s += fb[m * n_freq + k] * power[f * n_freq + k]
             mel_out.push(s)
     let int mel_expect = n_mels_val * n_frames

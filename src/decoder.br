@@ -153,9 +153,9 @@ pub struct TextDecoder:
 
         # Token + positional embeddings
         var [float] x = []
-        for i in 0..seq_t:
+        for i in 0..<seq_t:
             let int tid = tokens[i]
-            for j in 0..d:
+            for j in 0..<d:
                 x.push(self.tok_emb[tid * d + j] + self.pos_emb[i * d + j])
 
         # Transformer blocks
@@ -165,7 +165,7 @@ pub struct TextDecoder:
         # Layer norm on last position only
         # (parens around both range bounds are load-bearing — see math.br's
         # layer_norm_seq for why: the boring transpiler binds `..` tighter than `*`)
-        let [float] last    = x[((seq_t - 1) * d)..(seq_t * d)]
+        let [float] last    = x[((seq_t - 1) * d)..<(seq_t * d)]
         let [float] normed  = layer_norm_seq_gpu(last, self.ln_w, self.ln_b, 1, d)
 
         # Project to vocab (weight-tied: reuse tok_emb transposed, no bias).
@@ -184,10 +184,10 @@ pub struct TextDecoder:
         guard pos < 448 else throw "decoder: sequence exceeds maximum context (448)"
 
         var [float] x_new = []
-        for j in 0..d:
+        for j in 0..<d:
             x_new.push(self.tok_emb[token_id * d + j] + self.pos_emb[pos * d + j])
 
-        for i in 0..self.blocks.length:
+        for i in 0..<self.blocks.length:
             x_new = self.blocks[i].forward_step(x_new, audio.clone(), seq_a, d, n_head)
 
         let [float] normed = layer_norm_seq_gpu(x_new, self.ln_w, self.ln_b, 1, d)
@@ -214,7 +214,7 @@ pub struct TextDecoder:
             # Argmax over vocab
             var int   best_id  = 0
             var float best_val = logits[0]
-            for v in 0..logits.length:
+            for v in 0..<logits.length:
                 if logits[v] > best_val:
                     best_val = logits[v]
                     best_id  = v

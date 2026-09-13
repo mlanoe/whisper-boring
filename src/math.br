@@ -6,13 +6,13 @@ let float PI = 3.141592653589793
 
 pub req [float] zeros(int n):
     var [float] out = []
-    for _ in 0..n:
+    for _ in 0..<n:
         out.push(0.0)
     out
 
 pub req [float] vec_add([float] a, [float] b):
     var [float] out = []
-    for i in 0..a.length:
+    for i in 0..<a.length:
         out.push(a[i] + b[i])
     out
 
@@ -25,9 +25,9 @@ pub req [float] vec_scale([float] a, float s):
 # math_gpu.br's LinearKernel doc comment for why the GPU-side kernel needs its
 # second operand laid out this way (memory-coalescing).
 pub req [float] transpose_flat([float] src, int rows, int cols):
-    var [float] dst = [0.0 for ..rows * cols]
-    for i in 0..rows:
-        for j in 0..cols:
+    var [float] dst = [0.0 for ..<rows * cols]
+    for i in 0..<rows:
+        for j in 0..<cols:
             dst[j * rows + i] = src[i * cols + j]
     dst
 
@@ -74,23 +74,23 @@ pub req [float] rfft_windowed([float] audio, int start, [float] win, int n_fft) 
     # by (k*i) % n_fft. Works for any n_fft (Whisper uses n_fft=400, not a
     # power of 2), unlike the radix-2 Cooley-Tukey FFT this replaces.
     var [float] x = []
-    for i in 0..n_fft:
+    for i in 0..<n_fft:
         let float sample = if start + i < audio.length: audio[start + i] else: 0.0
         x.push(sample * win[i])
 
     var [float] cos_tab = []
     var [float] sin_tab = []
-    for i in 0..n_fft:
+    for i in 0..<n_fft:
         let float ang = -2.0 * PI * float(i) / float(n_fft)
         cos_tab.push(ang.cos())
         sin_tab.push(ang.sin())
 
     let int n_out = n_fft / 2 + 1
     var [float] mag = []
-    for k in 0..n_out:
+    for k in 0..<n_out:
         var float re = 0.0
         var float im = 0.0
-        for i in 0..n_fft:
+        for i in 0..<n_fft:
             let int idx = (k * i) % n_fft
             re += x[i] * cos_tab[idx]
             im += x[i] * sin_tab[idx]
@@ -100,7 +100,7 @@ pub req [float] rfft_windowed([float] audio, int start, [float] win, int n_fft) 
 # Convenience wrapper: takes a samples slice directly (unit window).
 pub req [float] rfft_flat([float] samples, int n_fft) throws:
     var [float] unit_win = []
-    for _ in 0..n_fft:
+    for _ in 0..<n_fft:
         unit_win.push(1.0)
     rfft_windowed(samples, 0, unit_win, n_fft)
 
@@ -131,19 +131,19 @@ pub req [float] layer_norm([float] x, [float] w, [float] b):
     v /= float(n)
     let float sd = (v + 1e-5).sqrt()
     var [float] out = []
-    for i in 0..n:
+    for i in 0..<n:
         out.push(w[i] * (x[i] - mu) / sd + b[i])
     out
 
 # Apply layer_norm to every row of a (seq Ã— d) matrix.
 pub req [float] layer_norm_seq([float] x, [float] w, [float] b, int seq, int d):
     var [float] out = []
-    for i in 0..seq:
+    for i in 0..<seq:
         # Parens around both range bounds are load-bearing: the boring transpiler
         # currently binds `..` tighter than `*` inside an index expression, so the
         # unparenthesized form transpiles to `i * (d..(i+1)) * d` instead of the
         # intended `(i*d)..((i+1)*d)`.
-        let [float] row    = x[(i * d)..((i + 1) * d)]
+        let [float] row    = x[(i * d)..<((i + 1) * d)]
         let [float] normed = layer_norm(row, w, b)
         for v in normed: out.push(v)
     out
@@ -153,10 +153,10 @@ pub req [float] layer_norm_seq([float] x, [float] w, [float] b, int seq, int d):
 # A (mÃ—k) Â· B (kÃ—n) â†’ C (mÃ—n), all row-major flat.
 pub req [float] matmul([float] a, [float] b, int m, int k, int n):
     var [float] c = []
-    for i in 0..m:
-        for j in 0..n:
+    for i in 0..<m:
+        for j in 0..<n:
             var float s = 0.0
-            for p in 0..k:
+            for p in 0..<k:
                 s += a[i * k + p] * b[p * n + j]
             c.push(s)
     c
@@ -164,10 +164,10 @@ pub req [float] matmul([float] a, [float] b, int m, int k, int n):
 # A (mÃ—k) Â· B^T (nÃ—k) â†’ C (mÃ—n).
 pub req [float] matmul_bt([float] a, [float] b, int m, int k, int n):
     var [float] c = []
-    for i in 0..m:
-        for j in 0..n:
+    for i in 0..<m:
+        for j in 0..<n:
             var float s = 0.0
-            for p in 0..k:
+            for p in 0..<k:
                 s += a[i * k + p] * b[j * k + p]
             c.push(s)
     c
@@ -176,10 +176,10 @@ pub req [float] matmul_bt([float] a, [float] b, int m, int k, int n):
 # x: (seq Ã— d_in), W: (d_out Ã— d_in), b: (d_out,) â†’ y: (seq Ã— d_out).
 pub req [float] linear([float] x, [float] w, [float] bv, int seq, int d_in, int d_out):
     var [float] out = []
-    for i in 0..seq:
-        for j in 0..d_out:
+    for i in 0..<seq:
+        for j in 0..<d_out:
             var float s = bv[j]
-            for p in 0..d_in:
+            for p in 0..<d_in:
                 s += x[i * d_in + p] * w[j * d_in + p]
             out.push(s)
     out
@@ -190,11 +190,11 @@ pub req [float] conv1d([float] x, [float] w, [float] bv,
                    int t, int c_in, int c_out, int k):
     let int pad = k / 2
     var [float] out = []
-    for i in 0..t:
-        for oc in 0..c_out:
+    for i in 0..<t:
+        for oc in 0..<c_out:
             var float s = bv[oc]
-            for ic in 0..c_in:
-                for ki in 0..k:
+            for ic in 0..<c_in:
+                for ki in 0..<k:
                     let int src = i + ki - pad
                     if src >= 0 and src < t:
                         s += x[src * c_in + ic] * w[oc * c_in * k + ic * k + ki]
@@ -212,15 +212,15 @@ pub req [float] attention([float] q, [float] k, [float] v,
     let float scale = float(d_k).sqrt()
     var [float] scores = matmul_bt(q, k, seq_q, d_k, seq_k)
 
-    for i in 0..seq_q:
-        for j in 0..seq_k:
+    for i in 0..<seq_q:
+        for j in 0..<seq_k:
             var float s = scores[i * seq_k + j] / scale
             if causal and j > i: s = -1e9
             scores[i * seq_k + j] = s
 
     var [float] weights = []
-    for i in 0..seq_q:
-        let [float] row = scores[(i * seq_k)..((i + 1) * seq_k)]
+    for i in 0..<seq_q:
+        let [float] row = scores[(i * seq_k)..<((i + 1) * seq_k)]
         let [float] p   = softmax(row)
         for w2 in p: weights.push(w2)
 
@@ -245,24 +245,24 @@ pub req [float] mha([float] x_q,  [float] x_kv,
 
     var [float] concat = zeros(seq_q * d)
 
-    for h in 0..n_head:
+    for h in 0..<n_head:
         let int off = h * d_head
 
         var [float] Qh = []
         var [float] Kh = []
         var [float] Vh = []
-        for i in 0..seq_q:
-            for j in 0..d_head:
+        for i in 0..<seq_q:
+            for j in 0..<d_head:
                 Qh.push(Q[i * d + off + j])
-        for i in 0..seq_k:
-            for j in 0..d_head:
+        for i in 0..<seq_k:
+            for j in 0..<d_head:
                 Kh.push(K[i * d + off + j])
                 Vh.push(V[i * d + off + j])
 
         let [float] head = attention(Qh, Kh, Vh, seq_q, seq_k, d_head, d_head, causal)
 
-        for i in 0..seq_q:
-            for j in 0..d_head:
+        for i in 0..<seq_q:
+            for j in 0..<d_head:
                 concat[i * d + off + j] = head[i * d_head + j]
 
     linear(concat, w_o, b_o, seq_q, d, d)

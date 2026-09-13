@@ -61,23 +61,23 @@ kernel StftPower:
 
             # Windowed samples for this frame
             var [float] x = []
-            for i in 0..n_fft:
+            for i in 0..<n_fft:
                 let float s = if start + i < n_padded: audio[start + i] * win[i] else: 0.0
                 x.push(s)
 
             # One period of cos/sin, reused via (k*i) % n_fft periodicity
             var [float] cos_tab = []
             var [float] sin_tab = []
-            for i in 0..n_fft:
+            for i in 0..<n_fft:
                 let ang = -2.0 * PI * float(i) / float(n_fft)
                 cos_tab.push(ang.cos())
                 sin_tab.push(ang.sin())
 
             # Direct DFT: one-sided power spectrum (n_freq bins)
-            for k in 0..power.freq:
+            for k in 0..<power.freq:
                 var float re = 0.0
                 var float im = 0.0
-                for i in 0..n_fft:
+                for i in 0..<n_fft:
                     let idx = (k * i) % n_fft
                     re += x[i] * cos_tab[idx]
                     im += x[i] * sin_tab[idx]
@@ -109,9 +109,9 @@ kernel MelApply:
     def ():
         let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
         if f < mel.frame:
-            for m in 0..mel.mel:
+            for m in 0..<mel.mel:
                 var float s = 0.0
-                for k in 0..fb.freq:
+                for k in 0..<fb.freq:
                     s += fb[freq = k, mel = m] * power[freq = k, frame = f]
                 mel[frame = f, mel = m] = s
 
@@ -134,7 +134,7 @@ kernel LogCompress:
     def ():
         let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
         if f < mel_in.frame:
-            for m in 0..mel_in.mel:
+            for m in 0..<mel_in.mel:
                 let v = if mel_in[frame = f, mel = m] > clamp_val: mel_in[frame = f, mel = m] else: clamp_val
                 mel_out[frame = f, mel = m] = v.log10()
 
@@ -153,11 +153,11 @@ pub req MelSpectrogram log_mel_spectrogram_gpu([float] audio) throws:
 
     # Reflect-pad audio
     var [float] padded = []
-    for i in 0..pad:
+    for i in 0..<pad:
         let int src = pad - i
         padded.push(if src < n_audio: audio[src] else: 0.0)
     for v in audio: padded.push(v)
-    for i in 0..pad:
+    for i in 0..<pad:
         let int src = n_audio - 2 - i
         padded.push(if src >= 0 and src < n_audio: audio[src] else: 0.0)
 
@@ -204,8 +204,8 @@ pub req MelSpectrogram log_mel_spectrogram_gpu([float] audio) throws:
         warn "audio is {total_secs:.1f}s, truncating to the first 30s (no windowed chunking yet)"
     let int cols = if n_frames < 3000: n_frames else: 3000
     var [float] fixed = zeros(n_mels * 3000)
-    for m in 0..n_mels:
-        for f in 0..cols:
+    for m in 0..<n_mels:
+        for f in 0..<cols:
             let float raw    = mel_log[m * n_frames + f]
             let float normed = ((if raw > floor_: raw else: floor_) + 4.0) / 4.0
             fixed[m * 3000 + f] = normed

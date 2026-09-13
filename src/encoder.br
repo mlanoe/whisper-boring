@@ -75,8 +75,8 @@ struct AudioEncoder:
         # Transpose to (T × C_in) for conv1d
         let int t_in = mel.n_frames
         var [float] x = []
-        for f in 0..t_in:
-            for m in 0..mel.n_mels:
+        for f in 0..<t_in:
+            for m in 0..<mel.n_mels:
                 x.push(mel.data[m * t_in + f])
 
         # Conv1(80 → d, k=3, stride=1) + GELU

@@ -46,7 +46,7 @@ pub req [float] hann_window(int n):
     # Periodic Hann window (denominator n, not n-1) — matches torch.hann_window's
     # default (periodic=True), which is what Whisper uses for its STFT.
     var [float] w = []
-    for i in 0..n:
+    for i in 0..<n:
         w.push(0.5 - 0.5 * (2.0 * PI * float(i) / float(n)).cos())
     w
 
@@ -63,25 +63,25 @@ pub req [float] mel_filterbank(int n_mels, int n_fft, int sr):
 
     # FFT bin center frequencies: linspace(0, f_max, n_freq)
     var [float] fftfreqs = []
-    for k in 0..n_freq:
+    for k in 0..<n_freq:
         fftfreqs.push(f_max * float(k) / float(n_freq - 1))
 
     # n_mels + 2 equally-spaced points in mel space, converted back to Hz
     let float mel_min = hz_to_mel(0.0)
     let float mel_max = hz_to_mel(f_max)
     var [float] mel_pts = []
-    for i in 0..(n_mels + 2):
+    for i in 0..<(n_mels + 2):
         let float mel = mel_min + (mel_max - mel_min) * float(i) / float(n_mels + 1)
         mel_pts.push(mel_to_hz(mel))
 
     var [float] fdiff = []
-    for i in 0..(n_mels + 1):
+    for i in 0..<(n_mels + 1):
         fdiff.push(mel_pts[i + 1] - mel_pts[i])
 
     var [float] fb = zeros(n_mels * n_freq)
-    for m in 0..n_mels:
+    for m in 0..<n_mels:
         let float enorm = 2.0 / (mel_pts[m + 2] - mel_pts[m])
-        for k in 0..n_freq:
+        for k in 0..<n_freq:
             let float lower = (fftfreqs[k] - mel_pts[m]) / fdiff[m]
             let float upper = (mel_pts[m + 2] - fftfreqs[k]) / fdiff[m + 1]
             var float w = if lower < upper: lower else: upper
@@ -100,11 +100,11 @@ pub req [float] stft_power([float] audio, int n_fft, int hop) throws:
     # Pad audio by n_fft/2 on each side (reflect padding, zero for short audio)
     let int pad = n_fft / 2
     var [float] padded = []
-    for i in 0..pad:
+    for i in 0..<pad:
         let int src = pad - i
         padded.push(if src < n_audio: audio[src] else: 0.0)
     for v in audio: padded.push(v)
-    for i in 0..pad:
+    for i in 0..<pad:
         let int src = n_audio - 2 - i
         padded.push(if src >= 0 and src < n_audio: audio[src] else: 0.0)
 
@@ -114,7 +114,7 @@ pub req [float] stft_power([float] audio, int n_fft, int hop) throws:
     let int n_frames = (padded.length - n_fft) / hop
     var [float] out  = []
 
-    for f in 0..n_frames:
+    for f in 0..<n_frames:
         let int start = f * hop
         let [float] mag = rfft_windowed(padded, start, win, n_fft)
         for v in mag: out.push(v * v)   # power = magnitude²
@@ -134,10 +134,10 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
 
     # mel = fb · power^T  (N_MELS × n_frames)
     var [float] mel = zeros(N_MELS * n_frames)
-    for m in 0..N_MELS:
-        for f in 0..n_frames:
+    for m in 0..<N_MELS:
+        for f in 0..<n_frames:
             var float s = 0.0
-            for k in 0..n_freq:
+            for k in 0..<n_freq:
                 s += fb[m * n_freq + k] * power[f * n_freq + k]
             mel[m * n_frames + f] = s
 
@@ -145,7 +145,7 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
     # not 10*log10 (this is not a dB scale).
     let float clamp_val = 1e-10
 
-    for i in 0..(N_MELS * n_frames):
+    for i in 0..<(N_MELS * n_frames):
         let float v = if mel[i] > clamp_val: mel[i] else: clamp_val
         mel[i] = v.log10()
 
@@ -154,7 +154,7 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
     for v in mel:
         if v > log_max: log_max = v
     let float floor_ = log_max - 8.0
-    for i in 0..(N_MELS * n_frames):
+    for i in 0..<(N_MELS * n_frames):
         mel[i] = (if mel[i] > floor_: mel[i] else: floor_) + 4.0
         mel[i] /= 4.0
 
@@ -164,8 +164,8 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
         warn "audio is {total_secs:.1f}s, truncating to the first 30s (no windowed chunking yet)"
     var [float] fixed = zeros(N_MELS * N_FRAMES)
     let int cols = if n_frames < N_FRAMES: n_frames else: N_FRAMES
-    for m in 0..N_MELS:
-        for f in 0..cols:
+    for m in 0..<N_MELS:
+        for f in 0..<cols:
             fixed[m * N_FRAMES + f] = mel[m * n_frames + f]
 
     MelSpectrogram(n_frames=N_FRAMES, n_mels=N_MELS, data=fixed)

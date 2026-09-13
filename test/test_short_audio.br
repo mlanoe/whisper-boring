@@ -6,7 +6,7 @@ use audio
 def main() throws:
     # 10 samples (< 160, one hop) can't produce even a single STFT frame.
     var [float] short_audio = []
-    for _ in 0..10:
+    for _ in 0..<10:
         short_audio.push(0.0)
 
     try:
@@ -25,7 +25,7 @@ def main() throws:
 
     # Regression guard: a normal-length clip must still work fine.
     var [float] ok_audio = []
-    for _ in 0..1000:
+    for _ in 0..<1000:
         ok_audio.push(0.0)
     let m3 = log_mel_spectrogram(ok_audio)
     print "ok_audio: n_frames={m3.n_frames} n_mels={m3.n_mels}  (expect 3000, 80)"

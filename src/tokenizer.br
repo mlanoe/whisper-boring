@@ -174,8 +174,8 @@ pub Tokenizer load_tokenizer(string dir) throws:
             else:
                 sp += 1
         if found_sp:
-            let string a = line[0..sp]
-            let string b = line[(sp + 1)..line.length]
+            let string a = line[0..<sp]
+            let string b = line[(sp + 1)..<line.length]
             merges.push([a, b])
 
     Tokenizer(vocab, reverse, merges)

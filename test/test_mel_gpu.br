@@ -26,11 +26,11 @@ def main() throws:
     let int n_audio  = samples.length
     let int pad      = 200
     var [float] padded = []
-    for i in 0..pad:
+    for i in 0..<pad:
         let int src = pad - i
         padded.push(if src < n_audio: samples[src] else: 0.0)
     for v in samples: padded.push(v)
-    for i in 0..pad:
+    for i in 0..<pad:
         let int src = n_audio - 2 - i
         padded.push(if src >= 0 and src < n_audio: samples[src] else: 0.0)
 
