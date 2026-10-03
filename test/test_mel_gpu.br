@@ -25,7 +25,7 @@ def main() throws:
     print "Computing GPU STFT power (simulated)..."
     let int n_audio  = samples.length
     let int pad      = 200
-    var [float] padded = []
+    mut [float] padded = []
     for i in 0..<pad:
         let int src = pad - i
         padded.push(if src < n_audio: samples[src] else: 0.0)

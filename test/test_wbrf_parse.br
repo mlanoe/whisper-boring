@@ -14,7 +14,7 @@ def main() throws:
     let int n_tensors = read_u32_le(bytes, 4)
     print "n_tensors = {n_tensors}  (expect 2)"
 
-    var {string=[float]} tensors = {=}
+    mut {string=[float]} tensors = {=}
     var int offset = 8
     var int ti = 0
 
@@ -26,7 +26,7 @@ def main() throws:
         let int n_elems = read_u32_le(bytes, offset)
         offset += 4
 
-        var [float] data = []
+        mut [float] data = []
         var int ei = 0
         while ei < n_elems:
             data.push(read_f32_le(bytes, offset))

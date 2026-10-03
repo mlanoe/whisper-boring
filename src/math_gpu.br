@@ -412,8 +412,8 @@ pub req ([float]'gpu'unified, [float], [float]) mha_step_gpu([float] x_new,
     let [float] k_new = linear_gpu(x_new, w_k, b_k, 1, d, d)
     let [float] v_new = linear_gpu(x_new, w_v, b_v, 1, d, d)
 
-    var [float] new_cache_k = cache_k
-    var [float] new_cache_v = cache_v
+    mut [float] new_cache_k = cache_k
+    mut [float] new_cache_v = cache_v
     for v in k_new: new_cache_k.push(v)
     for v in v_new: new_cache_v.push(v)
     let int seq_k = new_cache_k.length / d

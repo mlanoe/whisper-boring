@@ -152,7 +152,7 @@ pub struct TextDecoder:
         guard seq_t <= 448 else throw "decoder: sequence exceeds maximum context (448)"
 
         # Token + positional embeddings
-        var [float] x = []
+        var mut [float] x = []
         for i in 0..<seq_t:
             let int tid = tokens[i]
             for j in 0..<d:
@@ -183,7 +183,7 @@ pub struct TextDecoder:
 
         guard pos < 448 else throw "decoder: sequence exceeds maximum context (448)"
 
-        var [float] x_new = []
+        var mut [float] x_new = []
         for j in 0..<d:
             x_new.push(self.tok_emb[token_id * d + j] + self.pos_emb[pos * d + j])
 
@@ -208,7 +208,7 @@ pub struct TextDecoder:
             logits = self.forward_step_all(tid, pos, audio, seq_a)
             pos += 1
 
-        var [int] generated = []
+        mut [int] generated = []
         var int steps = 0
         while steps < max_new_tokens:
             # Argmax over vocab

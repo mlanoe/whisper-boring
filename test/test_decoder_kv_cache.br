@@ -19,7 +19,7 @@ let int N_HEAD  = 2
 let int N_VOCAB = 15
 
 pub req [float] mk(int n, float scale, float bias):
-    var [float] out = []
+    mut [float] out = []
     for i in 0..<n:
         out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
     out
@@ -80,7 +80,7 @@ def main() throws:
     let [float] audio = mk(seq_a * D, 0.4, 0.2)
 
     var float max_diff = 0.0
-    var [int] tokens_so_far = []
+    mut [int] tokens_so_far = []
     var int pos = 0
     while pos < seq_tokens.length:
         tokens_so_far.push(seq_tokens[pos])

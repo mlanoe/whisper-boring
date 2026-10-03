@@ -33,7 +33,7 @@ struct Tokenizer:
         #    find adjacent pairs — apply_merge only ever looks at pairs
         #    inside one word, and a merge can't happen across a one-element
         #    word boundary.
-        var [string] chars = []
+        mut [string] chars = []
         for ch in text.chars():
             chars.push("{ch}")
         var [[string]] words = [chars]
@@ -42,14 +42,14 @@ struct Tokenizer:
         for merge in self.merges:
             let string a = merge[0]
             let string b = merge[1]
-            var [[string]] next_words = []
+            mut [[string]] next_words = []
             for word in words:
                 let [string] merged = self.apply_merge(word, a, b)
                 next_words.push(merged)
             words = next_words
 
         # 3. Map subword strings to IDs.
-        var [int] ids = []
+        mut [int] ids = []
         for word in words:
             for tok in word:
                 let int id = self.vocab[tok] else -1
@@ -57,7 +57,7 @@ struct Tokenizer:
         ids
 
     req [string] apply_merge([string] word, string a, string b):
-        var [string] out = []
+        mut [string] out = []
         var int i = 0
         while i < word.length:
             if i < word.length - 1 and word[i] == a and word[i + 1] == b:
@@ -99,8 +99,8 @@ pub Tokenizer load_tokenizer(string dir) throws:
     let string vocab_path = "{dir}/vocab.json"
     let string vocab_text = fs.read(vocab_path)
 
-    var {string=int} vocab   = {=}
-    var {int=string} reverse = {=}
+    mut {string=int} vocab   = {=}
+    mut {int=string} reverse = {=}
 
     # Minimal JSON parser for {"token": id, ...}
     # Uses chr(34) for the double-quote character to avoid lexer confusion.
@@ -160,7 +160,7 @@ pub Tokenizer load_tokenizer(string dir) throws:
     let string merges_path = "{dir}/merges.txt"
     let [string] merge_lines = fs.readLines(merges_path)
 
-    var [[string]] merges = []
+    mut [[string]] merges = []
     for line in merge_lines:
         # Skip comment lines (start with '#') and blank lines
         if line.length == 0 or line[0] == "#":

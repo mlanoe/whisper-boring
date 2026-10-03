@@ -101,7 +101,7 @@ pub {string=[float]} parse_wbrf_tensors([uint8] bytes) throws:
     guard int(bytes[0]) == 87 and int(bytes[1]) == 66 and int(bytes[2]) == 82 and int(bytes[3]) == 70 else throw "Not a WBRF file (bad magic)"
 
     let int n_tensors = read_u32_le(bytes, 4)
-    var {string=[float]} tensors = {=}
+    mut {string=[float]} tensors = {=}
     var int offset = 8
     var int ti = 0
 
@@ -117,7 +117,7 @@ pub {string=[float]} parse_wbrf_tensors([uint8] bytes) throws:
         offset += 4
         guard offset + 4 * n_elems <= bytes.length else throw "WBRF truncated: tensor '{name}' expects {n_elems} floats but file ends early"
 
-        var [float] data = []
+        mut [float] data = []
         var int ei = 0
         while ei < n_elems:
             data.push(read_f32_le(bytes, offset))
@@ -137,7 +137,7 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
     let [uint8] bytes = fs.readBytes(weights_path)
     guard bytes.length >= 8 else throw "WBRF file too short: {weights_path}"
 
-    var {string=[float]} tensors = parse_wbrf_tensors(bytes)
+    mut {string=[float]} tensors = parse_wbrf_tensors(bytes)
 
     # ── Build AudioEncoder ────────────────────────────────────────────────────
     # Every `linear_gpu`-consumed weight matrix is transposed exactly once
@@ -145,7 +145,7 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
     # `linear_gpu` doc comment for why the GPU kernel needs this layout and
     # why doing it per-call was a real, measured performance bug.
     let int ad = cfg.n_audio_state
-    var [EncoderBlock] enc_blocks = []
+    mut [EncoderBlock] enc_blocks = []
     var int li = 0
     while li < cfg.n_audio_layer:
         let string ep = "encoder.blocks.{li}"
@@ -182,7 +182,7 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
 
     # ── Build TextDecoder ─────────────────────────────────────────────────────
     let int td = cfg.n_text_state
-    var [DecoderBlock] dec_blocks = []
+    mut [DecoderBlock] dec_blocks = []
     li = 0
     while li < cfg.n_text_layer:
         let string dp = "decoder.blocks.{li}"

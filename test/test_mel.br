@@ -6,7 +6,7 @@ use audio
 def main() throws:
     # ── FFT correctness: DC signal ────────────────────────────────────────────
     print "Testing rfft_flat on DC signal..."
-    var [float] dc = []
+    mut [float] dc = []
     for _ in 0..<16:
         dc.push(1.0)
     let [float] dc_mag = rfft_flat(dc, 16)
@@ -47,7 +47,7 @@ def main() throws:
 
     # ── Mel application (skip full N_FRAMES padding for speed) ───────────────
     print "Applying mel filterbank..."
-    var [float] mel_out = []
+    mut [float] mel_out = []
     for m in 0..<n_mels_val:
         for f in 0..<n_frames:
             var float s = 0.0

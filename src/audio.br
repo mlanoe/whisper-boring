@@ -45,7 +45,7 @@ pub float mel_to_hz(float mel):
 pub req [float] hann_window(int n):
     # Periodic Hann window (denominator n, not n-1) — matches torch.hann_window's
     # default (periodic=True), which is what Whisper uses for its STFT.
-    var [float] w = []
+    mut [float] w = []
     for i in 0..<n:
         w.push(0.5 - 0.5 * (2.0 * PI * float(i) / float(n)).cos())
     w
@@ -62,23 +62,23 @@ pub req [float] mel_filterbank(int n_mels, int n_fft, int sr):
     let float f_max  = float(sr) / 2.0
 
     # FFT bin center frequencies: linspace(0, f_max, n_freq)
-    var [float] fftfreqs = []
+    mut [float] fftfreqs = []
     for k in 0..<n_freq:
         fftfreqs.push(f_max * float(k) / float(n_freq - 1))
 
     # n_mels + 2 equally-spaced points in mel space, converted back to Hz
     let float mel_min = hz_to_mel(0.0)
     let float mel_max = hz_to_mel(f_max)
-    var [float] mel_pts = []
+    mut [float] mel_pts = []
     for i in 0..<(n_mels + 2):
         let float mel = mel_min + (mel_max - mel_min) * float(i) / float(n_mels + 1)
         mel_pts.push(mel_to_hz(mel))
 
-    var [float] fdiff = []
+    mut [float] fdiff = []
     for i in 0..<(n_mels + 1):
         fdiff.push(mel_pts[i + 1] - mel_pts[i])
 
-    var [float] fb = zeros(n_mels * n_freq)
+    mut [float] fb = zeros(n_mels * n_freq)
     for m in 0..<n_mels:
         let float enorm = 2.0 / (mel_pts[m + 2] - mel_pts[m])
         for k in 0..<n_freq:
@@ -99,7 +99,7 @@ pub req [float] stft_power([float] audio, int n_fft, int hop) throws:
 
     # Pad audio by n_fft/2 on each side (reflect padding, zero for short audio)
     let int pad = n_fft / 2
-    var [float] padded = []
+    mut [float] padded = []
     for i in 0..<pad:
         let int src = pad - i
         padded.push(if src < n_audio: audio[src] else: 0.0)
@@ -112,7 +112,7 @@ pub req [float] stft_power([float] audio, int n_fft, int hop) throws:
     # frames, but Whisper drops the last one (stft[..., :-1]) — so we compute
     # one fewer frame here rather than dropping it after the fact.
     let int n_frames = (padded.length - n_fft) / hop
-    var [float] out  = []
+    mut [float] out  = []
 
     for f in 0..<n_frames:
         let int start = f * hop
@@ -133,7 +133,7 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
     let [float] fb = mel_filterbank(N_MELS, N_FFT, SAMPLE_RATE)
 
     # mel = fb · power^T  (N_MELS × n_frames)
-    var [float] mel = zeros(N_MELS * n_frames)
+    mut [float] mel = zeros(N_MELS * n_frames)
     for m in 0..<N_MELS:
         for f in 0..<n_frames:
             var float s = 0.0
@@ -162,7 +162,7 @@ pub req MelSpectrogram log_mel_spectrogram([float] audio) throws:
     if n_frames > N_FRAMES:
         let float total_secs = float(n_frames * HOP_LENGTH) / float(SAMPLE_RATE)
         warn "audio is {total_secs:.1f}s, truncating to the first 30s (no windowed chunking yet)"
-    var [float] fixed = zeros(N_MELS * N_FRAMES)
+    mut [float] fixed = zeros(N_MELS * N_FRAMES)
     let int cols = if n_frames < N_FRAMES: n_frames else: N_FRAMES
     for m in 0..<N_MELS:
         for f in 0..<cols:
@@ -234,7 +234,7 @@ pub req [float] load_wav(string path) throws:
 
     # Read signed 16-bit PCM samples and normalise to [-1, 1]
     # For stereo, average the channels
-    var [float] samples = []
+    mut [float] samples = []
     var int i = data_offset
     let float scale = 1.0 / 32768.0
     while i + 1 < bytes.length:

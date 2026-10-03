@@ -11,7 +11,7 @@ let int D_OUT  = 51865
 let int STEPS  = 30
 
 pub req [float] mk(int n, float scale, float bias):
-    var [float] out = []
+    mut [float] out = []
     for i in 0..<n:
         out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
     out

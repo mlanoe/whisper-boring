@@ -4,7 +4,7 @@
 use audio_gpu
 
 def main() throws:
-    var [float] short_audio = []
+    mut [float] short_audio = []
     for _ in 0..<10:
         short_audio.push(0.0)
 

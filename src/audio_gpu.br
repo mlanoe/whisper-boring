@@ -60,14 +60,14 @@ kernel StftPower:
             let start = frame * hop
 
             # Windowed samples for this frame
-            var [float] x = []
+            mut [float] x = []
             for i in 0..<n_fft:
                 let float s = if start + i < n_padded: audio[start + i] * win[i] else: 0.0
                 x.push(s)
 
             # One period of cos/sin, reused via (k*i) % n_fft periodicity
-            var [float] cos_tab = []
-            var [float] sin_tab = []
+            mut [float] cos_tab = []
+            mut [float] sin_tab = []
             for i in 0..<n_fft:
                 let ang = -2.0 * PI * float(i) / float(n_fft)
                 cos_tab.push(ang.cos())
@@ -152,7 +152,7 @@ pub req MelSpectrogram log_mel_spectrogram_gpu([float] audio) throws:
     let int pad     = n_fft / 2
 
     # Reflect-pad audio
-    var [float] padded = []
+    mut [float] padded = []
     for i in 0..<pad:
         let int src = pad - i
         padded.push(if src < n_audio: audio[src] else: 0.0)
@@ -203,7 +203,7 @@ pub req MelSpectrogram log_mel_spectrogram_gpu([float] audio) throws:
         let float total_secs = float(n_frames * hop) / float(SAMPLE_RATE)
         warn "audio is {total_secs:.1f}s, truncating to the first 30s (no windowed chunking yet)"
     let int cols = if n_frames < 3000: n_frames else: 3000
-    var [float] fixed = zeros(n_mels * 3000)
+    mut [float] fixed = zeros(n_mels * 3000)
     for m in 0..<n_mels:
         for f in 0..<cols:
             let float raw    = mel_log[m * n_frames + f]

@@ -5,7 +5,7 @@ use audio
 
 def main() throws:
     # 10 samples (< 160, one hop) can't produce even a single STFT frame.
-    var [float] short_audio = []
+    mut [float] short_audio = []
     for _ in 0..<10:
         short_audio.push(0.0)
 
@@ -16,7 +16,7 @@ def main() throws:
         print "short_audio: caught expected error: {error}"
 
     # Fully empty audio too.
-    var [float] empty_audio = []
+    mut [float] empty_audio = []
     try:
         let m2 = log_mel_spectrogram(empty_audio)
         print "FAIL: expected a throw, got {m2.n_frames} frames"
@@ -24,7 +24,7 @@ def main() throws:
         print "empty_audio: caught expected error: {error}"
 
     # Regression guard: a normal-length clip must still work fine.
-    var [float] ok_audio = []
+    mut [float] ok_audio = []
     for _ in 0..<1000:
         ok_audio.push(0.0)
     let m3 = log_mel_spectrogram(ok_audio)

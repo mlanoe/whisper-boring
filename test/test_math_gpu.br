@@ -11,13 +11,13 @@ def main() throws:
     let int seq    = 5
     let int d_in   = 4
     let int d_out  = 3
-    var [float] x = []
+    mut [float] x = []
     for i in 0..<(seq * d_in):
         x.push(float(i) * 0.1)
-    var [float] w = []
+    mut [float] w = []
     for i in 0..<(d_out * d_in):
         w.push(float(i) * 0.05 - 0.2)
-    var [float] bv = []
+    mut [float] bv = []
     for i in 0..<d_out:
         bv.push(float(i) * 0.01)
 
@@ -40,8 +40,8 @@ def main() throws:
     print "gelu: max |cpu-gpu| = {gelu_diff:.8f}  (expect ~0)"
 
     # ── layer_norm_seq ────────────────────────────────────────────────────
-    var [float] ln_w = []
-    var [float] ln_b = []
+    mut [float] ln_w = []
+    mut [float] ln_b = []
     for i in 0..<d_in:
         ln_w.push(1.0 + float(i) * 0.1)
         ln_b.push(float(i) * 0.02)
@@ -61,13 +61,13 @@ def main() throws:
     let int seq_k = 6
     let int d_k   = 3
     let int d_v   = 3
-    var [float] q = []
+    mut [float] q = []
     for i in 0..<(seq_q * d_k):
         q.push(float(i) * 0.03 - 0.5)
-    var [float] k = []
+    mut [float] k = []
     for i in 0..<(seq_k * d_k):
         k.push(float(i) * 0.02 - 0.3)
-    var [float] v = []
+    mut [float] v = []
     for i in 0..<(seq_k * d_v):
         v.push(float(i) * 0.01)
 
@@ -95,22 +95,22 @@ def main() throws:
     # used to (slice each head out, run single-head attention, reassemble).
     let int n_head_attn = 3
     let int d_full       = d_k * n_head_attn
-    var [float] qm = []
+    mut [float] qm = []
     for i in 0..<(seq_q * d_full):
         qm.push(float(i) * 0.017 - 0.4)
-    var [float] km = []
+    mut [float] km = []
     for i in 0..<(seq_k * d_full):
         km.push(float(i) * 0.013 - 0.25)
-    var [float] vm = []
+    mut [float] vm = []
     for i in 0..<(seq_k * d_full):
         vm.push(float(i) * 0.009 - 0.1)
 
-    var [float] concat_ref = zeros(seq_q * d_full)
+    mut [float] concat_ref = zeros(seq_q * d_full)
     for h in 0..<n_head_attn:
         let int off = h * d_k
-        var [float] qh = []
-        var [float] kh = []
-        var [float] vh = []
+        mut [float] qh = []
+        mut [float] kh = []
+        mut [float] vh = []
         for i in 0..<seq_q:
             for j in 0..<d_k:
                 qh.push(qm[i * d_full + off + j])
@@ -133,13 +133,13 @@ def main() throws:
     # ── mha ───────────────────────────────────────────────────────────────
     let int d      = 8
     let int n_head = 2
-    var [float] xq = []
+    mut [float] xq = []
     for i in 0..<(seq_q * d):
         xq.push(float(i) * 0.02 - 0.4)
-    var [float] wq = []
-    var [float] wk = []
-    var [float] wv = []
-    var [float] wo = []
+    mut [float] wq = []
+    mut [float] wk = []
+    mut [float] wv = []
+    mut [float] wo = []
     for i in 0..<(d * d):
         wq.push(float(i) * 0.01 - 0.05)
         wk.push(float(i) * 0.008 - 0.04)
@@ -147,7 +147,7 @@ def main() throws:
         wo.push(float(i) * 0.004 - 0.02)
     let [float] bq = zeros(d)
     let [float] bo = zeros(d)
-    var [float] bv2 = []
+    mut [float] bv2 = []
     for i in 0..<d:
         bv2.push(float(i) * 0.001)
 
@@ -196,7 +196,7 @@ def main() throws:
     # `audio_like` stands in for the encoder output: same width (d) as xq,
     # a different length (seq_a != seq_q) to also exercise that case.
     let int seq_a = 5
-    var [float] audio_like = []
+    mut [float] audio_like = []
     for i in 0..<(seq_a * d):
         audio_like.push(float(i) * 0.015 - 0.35)
 
@@ -218,13 +218,13 @@ def main() throws:
     let int c_in  = 2
     let int c_out = 3
     let int kk    = 3
-    var [float] cx = []
+    mut [float] cx = []
     for i in 0..<(t_in * c_in):
         cx.push(float(i) * 0.05 - 0.15)
-    var [float] cw = []
+    mut [float] cw = []
     for i in 0..<(c_out * c_in * kk):
         cw.push(float(i) * 0.02 - 0.1)
-    var [float] cb = []
+    mut [float] cb = []
     for i in 0..<c_out:
         cb.push(float(i) * 0.01)
 
@@ -238,7 +238,7 @@ def main() throws:
 
     # ── conv1d stride 2 (encoder's conv2 pattern) — CPU reference computed inline ──
     let int t_out2 = t_in / 2
-    var [float] conv2_cpu = []
+    mut [float] conv2_cpu = []
     for i in 0..<t_out2:
         let int src = i * 2
         for oc in 0..<c_out:

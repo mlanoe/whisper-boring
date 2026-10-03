@@ -74,7 +74,7 @@ struct AudioEncoder:
         # Conv stem: mel.data is (N_MELS × N_FRAMES), we need (N_FRAMES × N_MELS)
         # Transpose to (T × C_in) for conv1d
         let int t_in = mel.n_frames
-        var [float] x = []
+        mut [float] x = []
         for f in 0..<t_in:
             for m in 0..<mel.n_mels:
                 x.push(mel.data[m * t_in + f])
@@ -86,7 +86,7 @@ struct AudioEncoder:
         # Conv2(d → d, k=3, stride=2) + GELU — halves the sequence length to 1500
         let int t_out = t_in / 2
         let [float]'gpu'unified c2 = conv1d_gpu(a1, self.conv2_w, self.conv2_b, t_in, d, d, 3, 2, t_out)
-        var [float] a2 = gelu_gpu(c2)
+        mut [float] a2 = gelu_gpu(c2)
 
         # Add positional embedding
         guard a2.length == self.pos_emb.length else throw "encoder: positional embedding size mismatch"

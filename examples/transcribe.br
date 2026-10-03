@@ -24,7 +24,7 @@ use model
 # at 440 Hz and verify the shape, without requiring real weights.
 def main() throws:
     let int n = SAMPLE_RATE                       # 16 000 samples = 1 second
-    var [float] sine = []
+    mut [float] sine = []
     for i in 0..<n:
         sine.push((2.0 * PI * 440.0 * float(i) / float(SAMPLE_RATE)).sin())
 

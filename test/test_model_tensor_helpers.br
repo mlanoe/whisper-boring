@@ -4,7 +4,7 @@
 use model
 
 def main() throws:
-    var {string=[float]} tensors = {=}
+    mut {string=[float]} tensors = {=}
     tensors["a.weight"] = [1.0, 2.0, 3.0, 4.0]
 
     # ── get_tensor ────────────────────────────────────────────────────────

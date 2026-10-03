@@ -10,7 +10,7 @@ let int D_IN  = 384
 let int D_OUT = 51865
 
 pub req [float] mk(int n, float scale, float bias):
-    var [float] out = []
+    mut [float] out = []
     for i in 0..<n:
         out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
     out
@@ -27,7 +27,7 @@ def main() throws:
 
     # CPU reference: plain matmul (row-major w: D_OUT x D_IN, matching linear_gpu's
     # convention used throughout math_gpu.br/math.br).
-    var [float] cpu_out = []
+    mut [float] cpu_out = []
     for o in 0..<D_OUT:
         var float acc = b[o]
         for i in 0..<D_IN:
