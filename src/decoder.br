@@ -73,9 +73,9 @@ pub struct DecoderBlock:
         let [float] r2  = vec_add(r1, ca)
 
         # MLP + residual
-        let [float]'gpu'unified h3  = layer_norm_seq_gpu(r2, self.ln3_w, self.ln3_b, seq_t, d)
-        let [float]'gpu'unified fc  = linear_gpu(h3, self.mlp_fc_w, self.mlp_fc_b, seq_t, d, d * 4)
-        let [float]'gpu'unified act = gelu_gpu(fc)
+        let [float]'kernel'unified h3  = layer_norm_seq_gpu(r2, self.ln3_w, self.ln3_b, seq_t, d)
+        let [float]'kernel'unified fc  = linear_gpu(h3, self.mlp_fc_w, self.mlp_fc_b, seq_t, d, d * 4)
+        let [float]'kernel'unified act = gelu_gpu(fc)
         let [float] pr  = linear_gpu(act, self.mlp_pr_w, self.mlp_pr_b, seq_t, d * 4, d)
         vec_add(r2, pr)
 
@@ -98,7 +98,7 @@ pub struct DecoderBlock:
         # feeds straight into `vec_add`, a real CPU op — nothing further is
         # gained by keeping it resident past this point (same total readback
         # count either way as materializing inside `mha_step_gpu` instead).
-        let [float]'gpu'unified h1 = layer_norm_seq_gpu(x_new, self.ln1_w, self.ln1_b, 1, d)
+        let [float]'kernel'unified h1 = layer_norm_seq_gpu(x_new, self.ln1_w, self.ln1_b, 1, d)
         let (sa, new_sa_k, new_sa_v) = mha_step_gpu(h1,
             self.sa_q_w, self.sa_q_b,
             self.sa_k_w, zeros(d),
@@ -112,7 +112,7 @@ pub struct DecoderBlock:
 
         # Cross-attention + residual. `h2` stays resident into
         # `mha_cross_step_gpu`'s own `x_new` the same way `h1` does above.
-        let [float]'gpu'unified h2 = layer_norm_seq_gpu(r1, self.ln2_w, self.ln2_b, 1, d)
+        let [float]'kernel'unified h2 = layer_norm_seq_gpu(r1, self.ln2_w, self.ln2_b, 1, d)
         let [float] ca = mha_cross_step_gpu(h2,
             self.ca_q_w, self.ca_q_b,
             self.cache_ca_k, self.cache_ca_v,
@@ -121,9 +121,9 @@ pub struct DecoderBlock:
         let [float] r2 = vec_add(r1, ca)
 
         # MLP + residual
-        let [float]'gpu'unified h3  = layer_norm_seq_gpu(r2, self.ln3_w, self.ln3_b, 1, d)
-        let [float]'gpu'unified fc  = linear_gpu(h3, self.mlp_fc_w, self.mlp_fc_b, 1, d, d * 4)
-        let [float]'gpu'unified act = gelu_gpu(fc)
+        let [float]'kernel'unified h3  = layer_norm_seq_gpu(r2, self.ln3_w, self.ln3_b, 1, d)
+        let [float]'kernel'unified fc  = linear_gpu(h3, self.mlp_fc_w, self.mlp_fc_b, 1, d, d * 4)
+        let [float]'kernel'unified act = gelu_gpu(fc)
         let [float] pr  = linear_gpu(act, self.mlp_pr_w, self.mlp_pr_b, 1, d * 4, d)
         vec_add(r2, pr)
 

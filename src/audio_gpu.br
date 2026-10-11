@@ -55,7 +55,7 @@ kernel StftPower:
         power    = [0.0 for freq = nfreq, frame = nf]
 
     def ():
-        let frame = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        let frame = .thread.x + .block.x * .block_dim.x
         if frame < power.frame:
             let start = frame * hop
 
@@ -107,7 +107,7 @@ kernel MelApply:
         mel   = [0.0 for frame = nf, mel = nm]
 
     def ():
-        let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        let f = .thread.x + .block.x * .block_dim.x
         if f < mel.frame:
             for m in 0..<mel.mel:
                 var float s = 0.0
@@ -132,7 +132,7 @@ kernel LogCompress:
         clamp_val = cv
 
     def ():
-        let f = gpu.thread.x + gpu.block.x * gpu.block_dim.x
+        let f = .thread.x + .block.x * .block_dim.x
         if f < mel_in.frame:
             for m in 0..<mel_in.mel:
                 let v = if mel_in[frame = f, mel = m] > clamp_val: mel_in[frame = f, mel = m] else: clamp_val

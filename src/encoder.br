@@ -42,9 +42,9 @@ struct EncoderBlock:
         let [float] r1  = vec_add(x, sa)
 
         # Pre-norm MLP + residual
-        let [float]'gpu'unified h2  = layer_norm_seq_gpu(r1, self.ln2_w, self.ln2_b, seq, d)
-        let [float]'gpu'unified fc  = linear_gpu(h2, self.mlp_fc_w, self.mlp_fc_b, seq, d, d * 4)
-        let [float]'gpu'unified act = gelu_gpu(fc)
+        let [float]'kernel'unified h2  = layer_norm_seq_gpu(r1, self.ln2_w, self.ln2_b, seq, d)
+        let [float]'kernel'unified fc  = linear_gpu(h2, self.mlp_fc_w, self.mlp_fc_b, seq, d, d * 4)
+        let [float]'kernel'unified act = gelu_gpu(fc)
         let [float] pr  = linear_gpu(act, self.mlp_pr_w, self.mlp_pr_b, seq, d * 4, d)
         vec_add(r1, pr)
 
@@ -80,12 +80,12 @@ struct AudioEncoder:
                 x.push(mel.data[m * t_in + f])
 
         # Conv1(80 → d, k=3, stride=1) + GELU
-        let [float]'gpu'unified c1 = conv1d_gpu(x, self.conv1_w, self.conv1_b, t_in, mel.n_mels, d, 3, 1, t_in)
-        var [float]'gpu'unified a1 = gelu_gpu(c1)
+        let [float]'kernel'unified c1 = conv1d_gpu(x, self.conv1_w, self.conv1_b, t_in, mel.n_mels, d, 3, 1, t_in)
+        var [float]'kernel'unified a1 = gelu_gpu(c1)
 
         # Conv2(d → d, k=3, stride=2) + GELU — halves the sequence length to 1500
         let int t_out = t_in / 2
-        let [float]'gpu'unified c2 = conv1d_gpu(a1, self.conv2_w, self.conv2_b, t_in, d, d, 3, 2, t_out)
+        let [float]'kernel'unified c2 = conv1d_gpu(a1, self.conv2_w, self.conv2_b, t_in, d, d, 3, 2, t_out)
         mut [float] a2 = gelu_gpu(c2)
 
         # Add positional embedding
