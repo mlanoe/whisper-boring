@@ -1,4 +1,14 @@
 [project]
 name = "whisper-boring"
-version = "0.1.0"
+version = "0.2.0"
 main = "src/main.br"
+
+[tensor.matmul]
+algorithm = "auto"
+
+[tensor.linear]
+algorithm = "auto"
+
+[tensor.linear.prefill]
+algorithm = "auto"
+precision = "mixed"

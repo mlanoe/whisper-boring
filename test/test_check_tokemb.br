@@ -1,7 +1,5 @@
 # Checks whether tok_emb (n_vocab x d, weight-tied embedding/output-projection
-# matrix) is fully populated after loading the real WBRF weights, or whether
-# only certain rows got loaded correctly (rows far from index 0 reading back
-# as all-zero would explain the decoder's degenerate logits).
+# matrix) is fully populated after loading the real WBRF weights.
 use model
 
 def main() throws:
@@ -13,11 +11,12 @@ def main() throws:
     print "[diag] d={d} n_vocab={n_vocab} tok_emb.length={w.decoder.tok_emb.length}"
 
     let [int] rows = [0, 57, 300, 1000, 25000, 49999, 50257, 51000, 51864]
-    for r in rows:
-        var float acc = 0.0
-        var int j = 0
-        while j < d:
-            let v = w.decoder.tok_emb[r * d + j]
-            acc += (if v < 0.0: 0.0 - v else: v)
-            j += 1
-        print "row {r}: sum|.| = {acc:.6f}  first3 = [{w.decoder.tok_emb[r*d]:.6f}, {w.decoder.tok_emb[r*d+1]:.6f}, {w.decoder.tok_emb[r*d+2]:.6f}]"
+    with w.decoder.tok_emb:
+        for r in rows:
+            var float32 acc = 0.0
+            var int j = 0
+            while j < d:
+                let v = w.decoder.tok_emb[r * d + j]
+                acc += (if v < 0.0: 0.0 - v else: v)
+                j += 1
+            print "row {r}: sum|.| = {acc:.6f}  first3 = [{w.decoder.tok_emb[r*d]:.6f}, {w.decoder.tok_emb[r*d+1]:.6f}, {w.decoder.tok_emb[r*d+2]:.6f}]"

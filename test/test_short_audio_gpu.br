@@ -1,10 +1,8 @@
-# test/test_short_audio_gpu.br — GPU-path mirror of test_short_audio.br:
-# log_mel_spectrogram_gpu must throw on too-short audio instead of indexing
-# an empty mel_log array (same bug as audio.br, fixed in audio_gpu.br).
+# test/test_short_audio_gpu.br — GPU-path mirror of test_short_audio.br
 use audio_gpu
 
 def main() throws:
-    mut [float] short_audio = []
+    mut [float32] short_audio = []
     for _ in 0..<10:
         short_audio.push(0.0)
 

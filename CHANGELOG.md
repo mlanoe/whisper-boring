@@ -7,6 +7,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Argmax GPU & Zero-Copy Token Generation** (`src/math_gpu.br`, `src/decoder.br`):
+  - Implemented 2-stage GPU reduction kernels `ArgMaxStage1Kernel` + `ArgMaxStage2Kernel` (`argmax_gpu`), reducing 51,865 logits directly on GPU and reading back only a single 4-byte token ID instead of transferring 207 KB of floats per autoregressive decode step (50,000x PCIe bandwidth reduction).
+  - Added `forward_step_kv_only` for prompt prefill (tokens 0..2), eliminating unnecessary vocab linear projections ($1 \times 512 \cdot 512 \times 51865$) during prompt initialization.
+  - Precomputed cross-attention KV caches once for all decoder blocks before entering token generation.
+  - Added `embed_tokens_sequence_gpu` in `src/math_gpu.br` to build the full sequence embedding in a single fused GPU kernel launch, eliminating the iterative per-token loop and `kv_append_gpu` reallocations in `TextDecoder.forward`.
+- **End-to-End 100% GPU Transcription Pipeline** (`src/model.br`, `src/audio_gpu.br`, `examples/transcribe.br`):
+  - Connected `log_mel_spectrogram_gpu` and `encoder_forward_gpu` directly into `Whisper.transcribe`, keeping the 768,000 encoder output floats resident in GPU memory across encoder and decoder.
+  - Rewrote `StftPower` kernel in `src/audio_gpu.br` using direct trigonometric evaluation without dynamic vector heap allocations (`[]` / `.push`), unlocking native WGSL, Metal MSL, and CUDA shader compatibility for GPU mel spectrogram extraction.
+  - Added cached precomputed tables `CACHED_HANN_400` and `CACHED_MEL_FB_80` in `src/audio_gpu.br`, avoiding recurrent CPU recalculations of the Hann window and Mel filterbank on each clip.
+- **Full `float32` migration & Boring v0.9.14+ compatibility** (`src/*.br`, `test/*.br`, `examples/*.br`):
+  - Migrated all model weights, activations, audio pipelines, and GPU kernels from `float` (`float64`) to `float32`, fixing WGSL (`--target wgpu`) and MSL (`--target metal`) shader compilation and halving host memory usage.
+  - Replaced `MelSpectrogram(..., data=fixed)` named constructor calls (`data` is now a reserved ECS keyword in `boring`) with positional construction.
+  - Upgraded `io.br`'s `read_bytes` (slice copy instead of per-byte push loop) and `bytes_to_str` (full multi-byte UTF-8 decoder).
+  - Precomputed DFT `cos_tab`/`sin_tab` twiddle tables once per `stft_power` call in `math.br`/`audio.br` instead of per STFT frame.
+- **100% GPU-resident weights, residual stream, and KV-cache** (`src/model.br`, `src/encoder.br`, `src/decoder.br`, `src/math_gpu.br`):
+  - Qualified all `EncoderBlock`, `AudioEncoder`, `DecoderBlock`, and `TextDecoder` weights/biases as `[float32]'kernel'unified`, uploaded once at model load time via `upload_floats_gpu`.
+  - Replaced CPU-side `vec_add` residual connections and host-side KV-cache growth with GPU-resident `add_gpu`, `add_layer_norm_decode_gpu`, `kv_append_gpu`, `embed_token_step_gpu`, and `slice_row_gpu`, eliminating device-to-host readbacks between layers and decode steps.
+  - Enabled `set_gpu_batch_limit(8)` during greedy decoding on Metal.
+- **`kernel.tensors.linear` integration & `tok_emb_t` removal** (`src/math_gpu.br`, `src/model.br`, `src/decoder.br`, `boring.toml`):
+  - Replaced hand-rolled `LinearKernel` and load-time `checked_transpose` calls with `kernel.tensors.linear` (`linear_gpu` and `linear_nobias_gpu`), using native `(d_out × d_in)` weight layout directly and eliminating `tok_emb_t` (~80–200 MB memory savings) as well as per-step `zeros(d)` / `zeros(n_vocab)` allocations.
+- **Fused FlashAttention (`d_head = 64`), FlashDecode, and Warp-Shuffle LayerNorm** (`src/math_gpu.br`):
+  - Added `FlashAttn64Kernel` (`seq_q > 1`) and split-K `FlashDecode64Kernel` + `FlashDecodeCombine64Kernel` (`seq_q == 1`), eliminating `transpose_gpu(k)` and the `n_head × 1500 × 1500` intermediate score matrix.
+  - Replaced single-thread-per-row `LayerNormSeqKernel` with warp-shuffle `layer_norm_seq_gpu` and fused `add_layer_norm_decode_gpu` (`.warp.shuffle_xor`).
+
 ### Fixed
 
 - **Mel-spectrogram bit-compatibility with Whisper** (`src/audio.br`, `src/audio_gpu.br`, `src/math.br`, `wgpu_test/`) — four formula mismatches identified by `wgpu_test/compare_whisper.py` are corrected, verified numerically against `whisper.audio.mel_filters`/`log_mel_spectrogram` (max abs diff < 2e-9 on the filterbank, < 1.3e-5 on the full pipeline on a real clip):

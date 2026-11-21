@@ -1,13 +1,11 @@
 # test/test_model_tensor_helpers.br — unit tests for model.br's get_tensor
-# and checked_transpose helpers (bug: missing/mis-sized tensors used to
-# panic deep in a dict index or transpose_flat instead of throwing).
+# and checked_transpose helpers.
 use model
 
 def main() throws:
-    mut {string=[float]} tensors = {=}
-    tensors["a.weight"] = [1.0, 2.0, 3.0, 4.0]
+    mut {string=[float32]} tensors = {=}
+    tensors["a.weight"] = [1.0 as float32, 2.0 as float32, 3.0 as float32, 4.0 as float32]
 
-    # ── get_tensor ────────────────────────────────────────────────────────
     let ok = get_tensor(tensors, "a.weight")
     print "get_tensor ok: {ok.length} elems  (expect 4)"
 
@@ -17,7 +15,6 @@ def main() throws:
     catch:
         print "get_tensor missing: caught expected error: {error}"
 
-    # ── checked_transpose ─────────────────────────────────────────────────
     let t_ok = checked_transpose(ok, 2, 2, "a.weight")
     print "checked_transpose ok: {t_ok.length} elems  (expect 4)"
 

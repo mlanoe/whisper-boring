@@ -1,22 +1,9 @@
 # examples/transcribe.br — end-to-end transcription demo
 #
 # Run with:  boring run examples/transcribe.br
-#
-# `use src.model`/`use src.audio`/`use src.math` (the dotted cross-directory
-# form) never actually resolves from a file outside src/ under `boring run`
-# -- switched to the bare same-project sibling-file form instead (`use
-# model`, works via the project src/ fallback search path).
-#
-# Import ORDER matters here, and not just cosmetically: `audio`/`math` must
-# come before `model` (which itself does `use audio` transitively). Loading
-# `model` first, then directly `use audio` again, silently drops `audio.br`'s
-# own top-level `let` constants (SAMPLE_RATE, N_MELS, ...) from this file's
-# scope -- pub functions/structs from a transitively-then-directly-loaded
-# sibling survive fine, only top-level `let` constants don't, and only when
-# the transitive load comes first. Real `boring` interpreter bug, filed
-# upstream (see this project's own commit history for the task id) --
-# revert to whatever import order reads best once that's fixed.
+
 use audio
+use audio_gpu
 use math
 use model
 
@@ -24,15 +11,15 @@ use model
 # at 440 Hz and verify the shape, without requiring real weights.
 def main() throws:
     let int n = SAMPLE_RATE                       # 16 000 samples = 1 second
-    mut [float] sine = []
+    mut [float32] sine = []
     for i in 0..<n:
-        sine.push((2.0 * PI * 440.0 * float(i) / float(SAMPLE_RATE)).sin())
+        sine.push((2.0 * PI * 440.0 * (i as float32) / (SAMPLE_RATE as float32)).sin())
 
-    let MelSpectrogram mel = log_mel_spectrogram(sine)
+    let MelSpectrogram mel = log_mel_spectrogram_gpu(sine)
     print "mel shape: {mel.n_mels} × {mel.n_frames}"   # expect 80 × 3000
 
     # Full transcription (requires weights)
-    # let Whisper w    = load_whisper("weights/base.wbrf", "weights/tokenizer", ModelSize.Base)
-    # let string text  = w.transcribe("audio.wav")
+    # mut Whisper w   = load_whisper("weights/base.wbrf", "weights/tokenizer", ModelSize.Base)
+    # let string text = w.transcribe("audio.wav")
     # print text
     print "done — uncomment the lines above once weights are available"

@@ -5,6 +5,7 @@ examples/*_rust/
 examples/*_cuda/
 examples/*_metal/
 examples/*_wgpu/
+examples/*_simd/
 # Generated `boring build --target ...` projects anywhere in the repo
 # (src/, test/, etc) — fully regeneratable from the .br source.
 *_rust/
@@ -12,6 +13,7 @@ examples/*_wgpu/
 *_metal/
 *_wgpu/
 *_rocm/
+*_simd/
 /wgpu_test/
 Cargo.lock
 .claude/worktrees/

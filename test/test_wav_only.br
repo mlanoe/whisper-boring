@@ -5,7 +5,6 @@ use audio
 def main() throws:
     let string wav_path = "test/tiny.wav"
 
-    # ── Raw bytes ────────────────────────────────────────────────────────────
     let [uint8] bytes = fs.readBytes(wav_path)
     print "File size: {bytes.length} bytes"
 
@@ -20,18 +19,17 @@ def main() throws:
     let int bps = read_u16_le(bytes, 34)
     print "Sample rate: {sr} Hz  channels: {ch}  bits: {bps}"
 
-    # ── load_wav ─────────────────────────────────────────────────────────────
     print "Loading WAV..."
-    let [float] samples = load_wav(wav_path)
+    let [float32] samples = load_wav(wav_path)
     print "Samples: {samples.length}  (expect 16000)"
 
-    let float s0    = samples[0]
-    let float s100  = samples[100]
+    let float32 s0   = samples[0]
+    let float32 s100 = samples[100]
     print "samples[0]   = {s0:.6f}  (440 Hz sine, expect ~0)"
     print "samples[100] = {s100:.6f}"
 
-    var float vmin = samples[0]
-    var float vmax = samples[0]
+    var float32 vmin = samples[0]
+    var float32 vmax = samples[0]
     for s in samples:
         if s < vmin: vmin = s
         if s > vmax: vmax = s

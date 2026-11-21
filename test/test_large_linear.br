@@ -1,7 +1,4 @@
-# Isolates whether LinearKernel is correct when the output needs MORE THAN
-# ONE workgroup (blocks > 1) — every prior test only ever exercised blocks=1
-# (small synthetic dims), but the real vocab projection (n_vocab=51865) needs
-# blocks=203, which the decoder-level test never covered.
+# Isolates whether linear_gpu is correct at vocab scale (n_vocab=51865).
 use io
 use math
 use math_gpu
@@ -9,32 +6,29 @@ use math_gpu
 let int D_IN  = 384
 let int D_OUT = 51865
 
-pub req [float] mk(int n, float scale, float bias):
-    mut [float] out = []
+pub req [float32] mk(int n, float32 scale, float32 bias):
+    mut [float32] out = []
     for i in 0..<n:
-        out.push((float((i * 37 + 11) % 97) / 97.0) * scale - bias)
+        out.push((((i * 37 + 11) % 97) as float32 / 97.0) * scale - bias)
     out
 
 def main() throws:
     print "=== large linear_gpu (blocks > 1) correctness ==="
 
-    let [float] x = mk(D_IN, 0.3, 0.1)
-    let [float] w = mk(D_IN * D_OUT, 0.2, 0.1)
-    let [float] b = mk(D_OUT, 0.1, 0.05)
+    let [float32] x = mk(D_IN, 0.3, 0.1)
+    let [float32] w = mk(D_IN * D_OUT, 0.2, 0.1)
+    let [float32] b = mk(D_OUT, 0.1, 0.05)
 
-    let [float] w_t = transpose_flat(w, D_OUT, D_IN)
-    let [float] gpu_out = linear_gpu(x, w_t, b, 1, D_IN, D_OUT)
+    let [float32] gpu_out = linear_gpu(x, w, b, 1, D_IN, D_OUT)
 
-    # CPU reference: plain matmul (row-major w: D_OUT x D_IN, matching linear_gpu's
-    # convention used throughout math_gpu.br/math.br).
-    mut [float] cpu_out = []
+    mut [float32] cpu_out = []
     for o in 0..<D_OUT:
-        var float acc = b[o]
+        var float32 acc = b[o]
         for i in 0..<D_IN:
             acc += x[i] * w[o * D_IN + i]
         cpu_out.push(acc)
 
-    var float max_diff = 0.0
+    var float32 max_diff = 0.0
     var int worst = 0
     var int o = 0
     while o < D_OUT:
@@ -53,3 +47,4 @@ def main() throws:
     print "gpu_out[51000]={gpu_out[51000]:.6f} cpu_out[51000]={cpu_out[51000]:.6f}"
     print "gpu_out[51864]={gpu_out[51864]:.6f} cpu_out[51864]={cpu_out[51864]:.6f}"
     print "max diff = {max_diff:.8f} at index {worst}"
+    guard max_diff < 1e-4 else throw "large linear_gpu diverged: max_diff={max_diff}"

@@ -1,11 +1,9 @@
 # test/test_short_audio.br — regression test for the "audio too short" panic
-# (log_mel_spectrogram indexing mel[0] on an empty mel array when n_frames == 0).
 use io
 use audio
 
 def main() throws:
-    # 10 samples (< 160, one hop) can't produce even a single STFT frame.
-    mut [float] short_audio = []
+    mut [float32] short_audio = []
     for _ in 0..<10:
         short_audio.push(0.0)
 
@@ -15,24 +13,20 @@ def main() throws:
     catch:
         print "short_audio: caught expected error: {error}"
 
-    # Fully empty audio too.
-    mut [float] empty_audio = []
+    mut [float32] empty_audio = []
     try:
         let m2 = log_mel_spectrogram(empty_audio)
         print "FAIL: expected a throw, got {m2.n_frames} frames"
     catch:
         print "empty_audio: caught expected error: {error}"
 
-    # Regression guard: a normal-length clip must still work fine.
-    mut [float] ok_audio = []
+    mut [float32] ok_audio = []
     for _ in 0..<1000:
         ok_audio.push(0.0)
     let m3 = log_mel_spectrogram(ok_audio)
     print "ok_audio: n_frames={m3.n_frames} n_mels={m3.n_mels}  (expect 3000, 80)"
 
-    # End-to-end: a real (truncated) WAV file with only 10 samples of PCM
-    # data must fail the same way through the full load_wav → mel path.
-    let [float] wav_samples = load_wav("test/very_short.wav")
+    let [float32] wav_samples = load_wav("test/very_short.wav")
     try:
         let m4 = log_mel_spectrogram(wav_samples)
         print "FAIL: expected a throw, got {m4.n_frames} frames"

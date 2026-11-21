@@ -1,11 +1,13 @@
 # src/model.br — Whisper model: weight loading and transcription pipeline
 
 use audio
+use audio_gpu
 use encoder
 use decoder
 use tokenizer
 use io
 use math
+use math_gpu
 
 # Supported model sizes and their hyperparameters.
 enum ModelSize:
@@ -42,22 +44,21 @@ struct ModelConfig:
                         n_text_ctx=448,  n_text_state=1024, n_text_head=16, n_text_layer=24)
 
 struct Whisper:
-    ModelConfig  config
-    AudioEncoder encoder
+    ModelConfig     config
+    AudioEncoder    encoder
     mut TextDecoder decoder
-    Tokenizer    tokenizer
+    Tokenizer       tokenizer
 
-    # Full transcription pipeline: audio path → transcript string.
-    # `def` (mutating): decoder.generate() grows each block's KV-cache.
+    # Full transcription pipeline: audio path → transcript string (100% GPU resident).
     def string transcribe(string audio_path) throws:
-        let [float]          samples = load_wav(audio_path)
+        let [float32]        samples   = load_wav(audio_path)
         print "[diag] loaded {samples.length} samples"
-        let MelSpectrogram   mel     = log_mel_spectrogram(samples)
+        let MelSpectrogram   mel       = log_mel_spectrogram_gpu(samples)
         print "[diag] mel: {mel.n_frames} frames"
-        let [float]          audio   = self.encoder.forward(mel)
+        let [float32]'kernel'unified audio = encoder_forward_gpu(self.encoder, mel)
         print "[diag] encoder done"
-        let int              seq_a   = mel.n_frames / 2  # halved by conv2 stride=2
-        let [int]            ids     = self.decoder.generate(audio, seq_a, 448)
+        let int              seq_a     = mel.n_frames / 2  # halved by conv2 stride=2
+        let [int]            ids       = self.decoder.generate(audio, seq_a, 448)
         print "[diag] decoder done: {ids.length} tokens"
         self.tokenizer.decode(ids)
 
@@ -71,37 +72,30 @@ struct Whisper:
 #     N bytes: name (UTF-8)
 #     4 bytes: number of elements (LE u32)
 #     4 × elements bytes: float32 values (LE, row-major)
-#
-# Generate this file from the original PyTorch checkpoint with:
-#   python tools/export_weights.py --model base --out weights/base.wbrf
 
-# Look up a required tensor by name, throwing a clear error instead of
-# panicking when a checkpoint is missing a tensor (model/config size
-# mismatch, or a truncated/corrupted .wbrf file).
-[float] get_tensor({string=[float]} tensors, string key) throws:
+pub [float32] get_tensor({string=[float32]} tensors, string key) throws:
     guard tensors.contains(key) else throw "missing tensor: {key}"
     tensors[key]
 
-# Transpose a flat weight matrix after checking its element count matches
-# rows*cols — a mismatched size (corrupt file, wrong --model size) would
-# otherwise panic deep inside transpose_flat's row-major indexing instead
-# of surfacing a clear error through this function's `throws`.
-[float] checked_transpose([float] src, int rows, int cols, string name) throws:
+pub [float32] checked_transpose([float32] src, int rows, int cols, string name) throws:
     guard src.length == rows * cols else throw "tensor '{name}' has {src.length} elements, expected {rows * cols} ({rows}x{cols})"
     transpose_flat(src, rows, cols)
 
-# Parse a WBRF binary blob into its {name -> flat float data} tensor map.
-# Every multi-byte read is bounds-checked against bytes.length first, so a
-# truncated or corrupted .wbrf file throws a clear error here instead of
-# panicking mid-parse (e.g. cut off in the middle of a tensor's float data).
-pub {string=[float]} parse_wbrf_tensors([uint8] bytes) throws:
+# Validate tensor size and upload once to a GPU-resident buffer.
+req [float32]'kernel'unified upload_tensor({string=[float32]} tensors, string key, int expected_len) throws:
+    let [float32] src = get_tensor(tensors, key)
+    guard src.length == expected_len else throw "tensor '{key}' has {src.length} elements, expected {expected_len}"
+    upload_floats_gpu(src)
+
+# Parse a WBRF binary blob into its {name -> flat float32 data} tensor map.
+pub {string=[float32]} parse_wbrf_tensors([uint8] bytes) throws:
     guard bytes.length >= 8 else throw "WBRF file too short"
 
     # Magic: "WBRF" = 0x57 0x42 0x52 0x46
     guard int(bytes[0]) == 87 and int(bytes[1]) == 66 and int(bytes[2]) == 82 and int(bytes[3]) == 70 else throw "Not a WBRF file (bad magic)"
 
     let int n_tensors = read_u32_le(bytes, 4)
-    mut {string=[float]} tensors = {=}
+    mut {string=[float32]} tensors = {=}
     var int offset = 8
     var int ti = 0
 
@@ -117,100 +111,96 @@ pub {string=[float]} parse_wbrf_tensors([uint8] bytes) throws:
         offset += 4
         guard offset + 4 * n_elems <= bytes.length else throw "WBRF truncated: tensor '{name}' expects {n_elems} floats but file ends early"
 
-        mut [float] data = []
+        mut [float32] values = [0.0 as float32 for ..<n_elems]
         var int ei = 0
         while ei < n_elems:
-            data.push(read_f32_le(bytes, offset))
+            values[ei] = read_f32_le(bytes, offset)
             offset += 4
             ei += 1
 
-        tensors[name] = data
+        tensors[name] = values
         ti += 1
 
     tensors
 
-Whisper load_whisper(string weights_path, string tokenizer_dir,
-                     ModelSize size) throws:
+pub Whisper load_whisper(string weights_path, string tokenizer_dir,
+                         ModelSize size) throws:
     let ModelConfig cfg = ModelConfig.for_size(size)
 
     # ── Parse WBRF binary ─────────────────────────────────────────────────────
     let [uint8] bytes = fs.readBytes(weights_path)
     guard bytes.length >= 8 else throw "WBRF file too short: {weights_path}"
 
-    mut {string=[float]} tensors = parse_wbrf_tensors(bytes)
+    mut {string=[float32]} tensors = parse_wbrf_tensors(bytes)
 
-    # ── Build AudioEncoder ────────────────────────────────────────────────────
-    # Every `linear_gpu`-consumed weight matrix is transposed exactly once
-    # here, at load time, rather than on every GPU call — see math_gpu.br's
-    # `linear_gpu` doc comment for why the GPU kernel needs this layout and
-    # why doing it per-call was a real, measured performance bug.
+    # ── Build AudioEncoder (weights uploaded once to GPU in native layout) ────
     let int ad = cfg.n_audio_state
     mut [EncoderBlock] enc_blocks = []
     var int li = 0
     while li < cfg.n_audio_layer:
         let string ep = "encoder.blocks.{li}"
         enc_blocks.push(EncoderBlock(
-            attn_q_w = checked_transpose(get_tensor(tensors, "{ep}.attn_q.weight"), ad, ad, "{ep}.attn_q.weight"),
-            attn_q_b = get_tensor(tensors, "{ep}.attn_q.bias"),
-            attn_k_w = checked_transpose(get_tensor(tensors, "{ep}.attn_k.weight"), ad, ad, "{ep}.attn_k.weight"),
-            attn_v_w = checked_transpose(get_tensor(tensors, "{ep}.attn_v.weight"), ad, ad, "{ep}.attn_v.weight"),
-            attn_v_b = get_tensor(tensors, "{ep}.attn_v.bias"),
-            attn_o_w = checked_transpose(get_tensor(tensors, "{ep}.attn_o.weight"), ad, ad, "{ep}.attn_o.weight"),
-            attn_o_b = get_tensor(tensors, "{ep}.attn_o.bias"),
-            ln1_w    = get_tensor(tensors, "{ep}.ln1.weight"),
-            ln1_b    = get_tensor(tensors, "{ep}.ln1.bias"),
-            ln2_w    = get_tensor(tensors, "{ep}.ln2.weight"),
-            ln2_b    = get_tensor(tensors, "{ep}.ln2.bias"),
-            mlp_fc_w = checked_transpose(get_tensor(tensors, "{ep}.mlp_fc.weight"), ad * 4, ad, "{ep}.mlp_fc.weight"),
-            mlp_fc_b = get_tensor(tensors, "{ep}.mlp_fc.bias"),
-            mlp_pr_w = checked_transpose(get_tensor(tensors, "{ep}.mlp_pr.weight"), ad, ad * 4, "{ep}.mlp_pr.weight"),
-            mlp_pr_b = get_tensor(tensors, "{ep}.mlp_pr.bias")
+            attn_q_w = upload_tensor(tensors, "{ep}.attn_q.weight", ad * ad),
+            attn_q_b = upload_tensor(tensors, "{ep}.attn_q.bias",   ad),
+            attn_k_w = upload_tensor(tensors, "{ep}.attn_k.weight", ad * ad),
+            attn_v_w = upload_tensor(tensors, "{ep}.attn_v.weight", ad * ad),
+            attn_v_b = upload_tensor(tensors, "{ep}.attn_v.bias",   ad),
+            attn_o_w = upload_tensor(tensors, "{ep}.attn_o.weight", ad * ad),
+            attn_o_b = upload_tensor(tensors, "{ep}.attn_o.bias",   ad),
+            ln1_w    = upload_tensor(tensors, "{ep}.ln1.weight",    ad),
+            ln1_b    = upload_tensor(tensors, "{ep}.ln1.bias",      ad),
+            ln2_w    = upload_tensor(tensors, "{ep}.ln2.weight",    ad),
+            ln2_b    = upload_tensor(tensors, "{ep}.ln2.bias",      ad),
+            mlp_fc_w = upload_tensor(tensors, "{ep}.mlp_fc.weight", ad * 4 * ad),
+            mlp_fc_b = upload_tensor(tensors, "{ep}.mlp_fc.bias",   ad * 4),
+            mlp_pr_w = upload_tensor(tensors, "{ep}.mlp_pr.weight", ad * ad * 4),
+            mlp_pr_b = upload_tensor(tensors, "{ep}.mlp_pr.bias",   ad)
         ))
         li += 1
 
     let AudioEncoder enc = AudioEncoder(
-        conv1_w    = get_tensor(tensors, "encoder.conv1.weight"),
-        conv1_b    = get_tensor(tensors, "encoder.conv1.bias"),
-        conv2_w    = get_tensor(tensors, "encoder.conv2.weight"),
-        conv2_b    = get_tensor(tensors, "encoder.conv2.bias"),
-        pos_emb    = get_tensor(tensors, "encoder.pos_emb"),
+        conv1_w    = upload_tensor(tensors, "encoder.conv1.weight", ad * cfg.n_mels * 3),
+        conv1_b    = upload_tensor(tensors, "encoder.conv1.bias",   ad),
+        conv2_w    = upload_tensor(tensors, "encoder.conv2.weight", ad * ad * 3),
+        conv2_b    = upload_tensor(tensors, "encoder.conv2.bias",   ad),
+        pos_emb    = upload_tensor(tensors, "encoder.pos_emb",      cfg.n_audio_ctx * ad),
         blocks     = enc_blocks,
-        ln_w       = get_tensor(tensors, "encoder.ln.weight"),
-        ln_b       = get_tensor(tensors, "encoder.ln.bias"),
+        ln_w       = upload_tensor(tensors, "encoder.ln.weight",    ad),
+        ln_b       = upload_tensor(tensors, "encoder.ln.bias",      ad),
         n_head_val = cfg.n_audio_head
     )
 
-    # ── Build TextDecoder ─────────────────────────────────────────────────────
+    # ── Build TextDecoder (no tok_emb_t duplicate; native kernel.tensors.linear)
     let int td = cfg.n_text_state
     mut [DecoderBlock] dec_blocks = []
     li = 0
     while li < cfg.n_text_layer:
         let string dp = "decoder.blocks.{li}"
         dec_blocks.push(DecoderBlock(
-            sa_q_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_q.weight"), td, td, "{dp}.sa_q.weight"),
-            sa_q_b   = get_tensor(tensors, "{dp}.sa_q.bias"),
-            sa_k_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_k.weight"), td, td, "{dp}.sa_k.weight"),
-            sa_v_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_v.weight"), td, td, "{dp}.sa_v.weight"),
-            sa_v_b   = get_tensor(tensors, "{dp}.sa_v.bias"),
-            sa_o_w   = checked_transpose(get_tensor(tensors, "{dp}.sa_o.weight"), td, td, "{dp}.sa_o.weight"),
-            sa_o_b   = get_tensor(tensors, "{dp}.sa_o.bias"),
-            ln1_w    = get_tensor(tensors, "{dp}.ln1.weight"),
-            ln1_b    = get_tensor(tensors, "{dp}.ln1.bias"),
-            ca_q_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_q.weight"), td, td, "{dp}.ca_q.weight"),
-            ca_q_b   = get_tensor(tensors, "{dp}.ca_q.bias"),
-            ca_k_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_k.weight"), td, td, "{dp}.ca_k.weight"),
-            ca_v_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_v.weight"), td, td, "{dp}.ca_v.weight"),
-            ca_v_b   = get_tensor(tensors, "{dp}.ca_v.bias"),
-            ca_o_w   = checked_transpose(get_tensor(tensors, "{dp}.ca_o.weight"), td, td, "{dp}.ca_o.weight"),
-            ca_o_b   = get_tensor(tensors, "{dp}.ca_o.bias"),
-            ln2_w    = get_tensor(tensors, "{dp}.ln2.weight"),
-            ln2_b    = get_tensor(tensors, "{dp}.ln2.bias"),
-            mlp_fc_w = checked_transpose(get_tensor(tensors, "{dp}.mlp_fc.weight"), td * 4, td, "{dp}.mlp_fc.weight"),
-            mlp_fc_b = get_tensor(tensors, "{dp}.mlp_fc.bias"),
-            mlp_pr_w = checked_transpose(get_tensor(tensors, "{dp}.mlp_pr.weight"), td, td * 4, "{dp}.mlp_pr.weight"),
-            mlp_pr_b = get_tensor(tensors, "{dp}.mlp_pr.bias"),
-            ln3_w    = get_tensor(tensors, "{dp}.ln3.weight"),
-            ln3_b    = get_tensor(tensors, "{dp}.ln3.bias"),
+            sa_q_w     = upload_tensor(tensors, "{dp}.sa_q.weight",   td * td),
+            sa_q_b     = upload_tensor(tensors, "{dp}.sa_q.bias",     td),
+            sa_k_w     = upload_tensor(tensors, "{dp}.sa_k.weight",   td * td),
+            sa_v_w     = upload_tensor(tensors, "{dp}.sa_v.weight",   td * td),
+            sa_v_b     = upload_tensor(tensors, "{dp}.sa_v.bias",     td),
+            sa_o_w     = upload_tensor(tensors, "{dp}.sa_o.weight",   td * td),
+            sa_o_b     = upload_tensor(tensors, "{dp}.sa_o.bias",     td),
+            ln1_w      = upload_tensor(tensors, "{dp}.ln1.weight",    td),
+            ln1_b      = upload_tensor(tensors, "{dp}.ln1.bias",      td),
+            ca_q_w     = upload_tensor(tensors, "{dp}.ca_q.weight",   td * td),
+            ca_q_b     = upload_tensor(tensors, "{dp}.ca_q.bias",     td),
+            ca_k_w     = upload_tensor(tensors, "{dp}.ca_k.weight",   td * td),
+            ca_v_w     = upload_tensor(tensors, "{dp}.ca_v.weight",   td * td),
+            ca_v_b     = upload_tensor(tensors, "{dp}.ca_v.bias",     td),
+            ca_o_w     = upload_tensor(tensors, "{dp}.ca_o.weight",   td * td),
+            ca_o_b     = upload_tensor(tensors, "{dp}.ca_o.bias",     td),
+            ln2_w      = upload_tensor(tensors, "{dp}.ln2.weight",    td),
+            ln2_b      = upload_tensor(tensors, "{dp}.ln2.bias",      td),
+            mlp_fc_w   = upload_tensor(tensors, "{dp}.mlp_fc.weight", td * 4 * td),
+            mlp_fc_b   = upload_tensor(tensors, "{dp}.mlp_fc.bias",   td * 4),
+            mlp_pr_w   = upload_tensor(tensors, "{dp}.mlp_pr.weight", td * td * 4),
+            mlp_pr_b   = upload_tensor(tensors, "{dp}.mlp_pr.bias",   td),
+            ln3_w      = upload_tensor(tensors, "{dp}.ln3.weight",    td),
+            ln3_b      = upload_tensor(tensors, "{dp}.ln3.bias",      td),
             cache_sa_k = [],
             cache_sa_v = [],
             cache_ca_k = [],
@@ -220,12 +210,11 @@ Whisper load_whisper(string weights_path, string tokenizer_dir,
         li += 1
 
     let TextDecoder dec = TextDecoder(
-        tok_emb    = get_tensor(tensors, "decoder.tok_emb"),
-        tok_emb_t  = checked_transpose(get_tensor(tensors, "decoder.tok_emb"), cfg.n_vocab, td, "decoder.tok_emb"),
-        pos_emb    = get_tensor(tensors, "decoder.pos_emb"),
+        tok_emb    = upload_tensor(tensors, "decoder.tok_emb", cfg.n_vocab * td),
+        pos_emb    = upload_tensor(tensors, "decoder.pos_emb", cfg.n_text_ctx * td),
         blocks     = dec_blocks,
-        ln_w       = get_tensor(tensors, "decoder.ln.weight"),
-        ln_b       = get_tensor(tensors, "decoder.ln.bias"),
+        ln_w       = upload_tensor(tensors, "decoder.ln.weight", td),
+        ln_b       = upload_tensor(tensors, "decoder.ln.bias",   td),
         n_head_val = cfg.n_text_head
     )
 

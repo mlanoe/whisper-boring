@@ -2,30 +2,19 @@
 
 A port of [Whisper](https://github.com/openai/whisper) — OpenAI's automatic speech recognition model — written in [Boring](https://github.com/mlanoe/boring), a language that compiles to Rust.
 
-The goal is a clean, readable implementation that produces fast, native Rust code and can target multiple compute backends: CPU, CUDA, Metal, and wgpu.
+The goal is a clean, readable implementation that produces fast, native Rust code and can target multiple compute backends: CPU SIMD, CUDA, Metal, ROCm, and wgpu.
 
 ---
 
 ## Status
 
 The full pipeline — WAV loading, log-mel spectrogram, encoder, decoder with
-KV-cache, greedy decoding, tokenizer — is implemented and runs end-to-end.
-`boring build --target metal` (Apple Silicon/macOS) compiles cleanly and
-produces correct transcriptions against real OpenAI Whisper weights (`base`
-model verified against a real speech sample). CUDA, ROCm, and wgpu targets
-share the same `src/*.br` source (GPU kernels are written once, per the
-Metal backend doc's `'unified`/`'sync`/`'gpu` qualifiers) but are unverified
-on this project specifically — Metal is the actively-tested backend so far,
-matching the project's own "compare against reference Whisper" benchmark
-goal (`CLAUDE.md`).
-
-The plain `std` target (`boring build`, no `--target`) does **not** build —
-this project's GPU-callable kernels have no CPU-only host codegen path in
-`boring` today (a real compiler gap, filed upstream). Use `--target metal`
-(or another GPU target) instead.
-
-Benchmarking against Python/PyTorch reference Whisper (this project's
-stated end goal) hasn't started yet.
+GPU-resident KV-cache, greedy decoding, tokenizer — is implemented in `float32`
+and runs end-to-end across backends:
+- `boring build --target metal` (Apple Silicon/macOS — `simdgroup_matrix` via `kernel.tensors.linear`, FlashAttention / FlashDecode, and command-buffer batching)
+- `boring build --target simd` (portable multi-threaded CPU with AVX-512 / AVX2+FMA / NEON runtime detection)
+- `boring build --target wgpu` (cross-platform DirectX 12 / Vulkan / Metal)
+- `boring build --target cuda` (NVIDIA GPU with cuBLAS SGEMM via `kernel.tensors.linear`)
 
 ---
 
@@ -45,7 +34,7 @@ See the [Boring repository](https://github.com/mlanoe/boring) for the full langu
 
 ## Prerequisites
 
-- [Rust toolchain](https://rustup.rs/) (edition 2021)
+- [Rust toolchain](https://rustup.rs/) (edition 2024)
 - [boring](https://github.com/mlanoe/boring) installed
 
 ```sh
@@ -62,8 +51,14 @@ boring run examples/transcribe.br
 
 # Full transcription, transpiled to Rust + Metal (project mode, via boring.toml)
 boring build --target metal
-cd src/main_metal && cargo build
-./target/debug/main path/to/audio.wav --model base \
+cd src/main_metal && cargo build --release
+./target/release/main-metal path/to/audio.wav --model base \
+    --weights weights/base.wbrf --tokenizer weights/tokenizer
+
+# Portable multi-threaded CPU SIMD build (AVX-512 / AVX2+FMA / NEON)
+boring build --target simd
+cd src/main_simd && cargo build --release
+./target/release/main-simd path/to/audio.wav --model base \
     --weights weights/base.wbrf --tokenizer weights/tokenizer
 ```
 
@@ -81,11 +76,15 @@ python tools/export_weights.py --model base --out weights/base.wbrf
 ```
 whisper-boring/
 ├── src/
-│   ├── model.br        # Transformer model definition
-│   ├── encoder.br      # Audio encoder
-│   ├── decoder.br      # Text decoder
-│   ├── tokenizer.br    # Token encoding / decoding
+│   ├── model.br        # Transformer model definition and WBRF weight loading
+│   ├── encoder.br      # GPU-resident audio encoder
+│   ├── decoder.br      # GPU-resident text decoder with KV-cache
+│   ├── math.br         # CPU linear algebra & DFT primitives (float32)
+│   ├── math_gpu.br     # GPU kernels (kernel.tensors.linear, FlashAttention, FlashDecode, Warp LayerNorm)
+│   ├── tokenizer.br    # BPE token encoding / decoding
 │   ├── audio.br        # Audio loading and mel-spectrogram
+│   ├── audio_gpu.br    # GPU STFT and mel-spectrogram kernels
+│   ├── io.br           # Binary & UTF-8 I/O helpers
 │   └── main.br         # CLI entry point
 ├── examples/
 │   └── transcribe.br   # End-to-end transcription example

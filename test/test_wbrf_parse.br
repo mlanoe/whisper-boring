@@ -1,7 +1,4 @@
-# test/test_wbrf_parse.br — sanity-checks the WBRF parsing logic in model.br's
-# load_whisper() at small scale (a couple of tiny tensors), independent of the
-# interpreter's array-size limitation that currently blocks parsing a full
-# multi-million-float real model checkpoint.
+# test/test_wbrf_parse.br — sanity-checks the WBRF parsing logic
 use io
 
 def main() throws:
@@ -14,7 +11,7 @@ def main() throws:
     let int n_tensors = read_u32_le(bytes, 4)
     print "n_tensors = {n_tensors}  (expect 2)"
 
-    mut {string=[float]} tensors = {=}
+    mut {string=[float32]} tensors = {=}
     var int offset = 8
     var int ti = 0
 
@@ -26,17 +23,17 @@ def main() throws:
         let int n_elems = read_u32_le(bytes, offset)
         offset += 4
 
-        mut [float] data = []
+        mut [float32] values = []
         var int ei = 0
         while ei < n_elems:
-            data.push(read_f32_le(bytes, offset))
+            values.push(read_f32_le(bytes, offset))
             offset += 4
             ei += 1
 
-        tensors[name] = data
+        tensors[name] = values
         ti += 1
 
-    let [float] foo = tensors["foo.weight"]
-    let [float] bar = tensors["bar.bias"]
+    let [float32] foo = tensors["foo.weight"]
+    let [float32] bar = tensors["bar.bias"]
     print "foo.weight = [{foo[0]}, {foo[1]}, {foo[2]}]  (expect [1.5, 2.5, 3.5])"
     print "bar.bias = [{bar[0]}, {bar[1]}]  (expect [-1, 4.25])"
