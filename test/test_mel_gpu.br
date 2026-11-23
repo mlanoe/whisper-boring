@@ -60,4 +60,18 @@ def main() throws:
     print "GPU mel[0] = {mel0:.4f}"
     print "GPU mel shape: {80} × {n_frames} = {k_mel.mel.length}"
 
+    print "Verifying log_mel_spectrogram_gpu_resident..."
+    let MelSpectrogram mel_ref = log_mel_spectrogram_gpu(samples)
+    let ([float32] mel_res, int res_frames, int res_mels) = log_mel_spectrogram_gpu_resident(samples)
+    guard res_frames == 3000 and res_mels == 80 else throw "resident mel shape mismatch"
+    var float32 max_res_diff = 0.0
+    for f in 0..<res_frames:
+        for m in 0..<res_mels:
+            let float32 a = mel_ref.data[m * 3000 + f]
+            let float32 b = mel_res[f * 80 + m]
+            let float32 d = if a > b: a - b else: b - a
+            if d > max_res_diff: max_res_diff = d
+    print "log_mel_spectrogram_gpu_resident max diff = {max_res_diff:.8f} (expect 0)"
+    guard max_res_diff < 1e-6 else throw "resident mel diverged from reference!"
+
     print "=== GPU test passed ==="

@@ -78,4 +78,29 @@ def main() throws:
     print "final max diff = {max_diff:.8f}  (expect ~0)"
     guard max_diff < 1e-5 else throw "KV-cache path diverged from reference (max diff {max_diff})"
 
+    # Verify batched prompt prefill + incremental step matches reference argmax
+    mut TextDecoder dec_prefill = TextDecoder(
+        tok_emb = upload_floats_gpu(mk(N_VOCAB * D, 0.3, 0.15)),
+        pos_emb = upload_floats_gpu(mk(448 * D, 0.2, 0.1)),
+        blocks = [mk_block(), mk_block()],
+        ln_w = upload_floats_gpu(mk(D, 0.05, -1.0)), ln_b = upload_floats_gpu(mk(D, 0.05, 0.0)), n_head_val = N_HEAD)
+    let [int] prompt = [seq_tokens[0], seq_tokens[1], seq_tokens[2], seq_tokens[3]]
+    let [float32] logits_prompt_ref = dec_ref.forward(prompt, audio, seq_a)
+    var int best_ref = 0
+    for i in 1..<logits_prompt_ref.length:
+        if logits_prompt_ref[i] > logits_prompt_ref[best_ref]:
+            best_ref = i
+    let int best_prefill = dec_prefill.prefill_prompt_token_gpu(prompt, audio, seq_a)
+    guard best_prefill == best_ref else throw "prefill_prompt_token_gpu mismatch: got {best_prefill}, expected {best_ref}"
+
+    let [int] prompt_plus = [seq_tokens[0], seq_tokens[1], seq_tokens[2], seq_tokens[3], best_ref]
+    let [float32] logits_step_ref = dec_ref.forward(prompt_plus, audio, seq_a)
+    var int best_step_ref = 0
+    for i in 1..<logits_step_ref.length:
+        if logits_step_ref[i] > logits_step_ref[best_step_ref]:
+            best_step_ref = i
+    let int best_step_kv = dec_prefill.forward_step_token_gpu(best_ref, 4, audio, seq_a)
+    guard best_step_kv == best_step_ref else throw "forward_step_token_gpu after prefill mismatch: got {best_step_kv}, expected {best_step_ref}"
+    print "batched prompt prefill + step argmax verified!"
+
     print "=== decoder KV-cache test passed ==="

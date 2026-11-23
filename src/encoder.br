@@ -77,16 +77,13 @@ pub struct AudioEncoder:
     req [float32] forward(MelSpectrogram mel) throws:
         encoder_forward_gpu(self, mel)
 
-pub req [float32]'kernel'unified encoder_forward_gpu(AudioEncoder enc, MelSpectrogram mel) throws:
+pub req [float32]'kernel'unified encoder_forward_from_gpu_mel(
+        AudioEncoder enc, [float32]'kernel'global x, int t_in, int n_mels) throws:
     let int d      = enc.d()
     let int n_head = enc.n_head()
-    let int t_in   = mel.n_frames
-
-    # Conv stem: mel.data is (N_MELS × N_FRAMES), transpose on GPU to (N_FRAMES × N_MELS)
-    let [float32]'kernel'unified x = transpose_gpu(mel.data, mel.n_mels, t_in)
 
     # Conv1(80 → d, k=3, stride=1) + GELU
-    let [float32]'kernel'unified c1 = conv1d_gpu(x, enc.conv1_w, enc.conv1_b, t_in, mel.n_mels, d, 3, 1, t_in)
+    let [float32]'kernel'unified c1 = conv1d_gpu(x, enc.conv1_w, enc.conv1_b, t_in, n_mels, d, 3, 1, t_in)
     let [float32]'kernel'unified a1 = gelu_gpu(c1)
 
     # Conv2(d → d, k=3, stride=2) + GELU — halves sequence length to 1500
@@ -104,3 +101,9 @@ pub req [float32]'kernel'unified encoder_forward_gpu(AudioEncoder enc, MelSpectr
 
     # Final layer norm
     layer_norm_seq_gpu(h, enc.ln_w, enc.ln_b, t_out, d)
+
+pub req [float32]'kernel'unified encoder_forward_gpu(AudioEncoder enc, MelSpectrogram mel) throws:
+    let int t_in = mel.n_frames
+    # Conv stem: mel.data is (N_MELS × N_FRAMES), transpose on GPU to (N_FRAMES × N_MELS)
+    let [float32]'kernel'unified x = transpose_gpu(mel.data, mel.n_mels, t_in)
+    encoder_forward_from_gpu_mel(enc, x, t_in, mel.n_mels)

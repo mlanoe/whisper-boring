@@ -10,12 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - **Argmax GPU & Zero-Copy Token Generation** (`src/math_gpu.br`, `src/decoder.br`):
+  - Refactored `decoder_block_step_gpu` and `ensure_cross_kv_gpu` to mutate GPU-resident `DecoderBlock` fields (`b.cache_sa_k`, `b.cache_sa_v`, `b.cache_ca_k`, `b.cache_ca_v`) in place, eliminating per-step struct reconstruction and weight cloning across all decoder layers.
   - Implemented 2-stage GPU reduction kernels `ArgMaxStage1Kernel` + `ArgMaxStage2Kernel` (`argmax_gpu`), reducing 51,865 logits directly on GPU and reading back only a single 4-byte token ID instead of transferring 207 KB of floats per autoregressive decode step (50,000x PCIe bandwidth reduction).
-  - Added `forward_step_kv_only` for prompt prefill (tokens 0..2), eliminating unnecessary vocab linear projections ($1 \times 512 \cdot 512 \times 51865$) during prompt initialization.
+  - Added batched prompt prefill (`prefill_prompt_token_gpu`, `decoder_block_prefill_gpu`, `mha_prefill_nobias_k_gpu`, `mha_cross_prefill_gpu`) to process all 4 prompt tokens in a single parallel pass (populating cross-KV and self-KV caches simultaneously and running causal FlashAttention), replacing 4 sequential decode passes.
   - Precomputed cross-attention KV caches once for all decoder blocks before entering token generation.
   - Added `embed_tokens_sequence_gpu` in `src/math_gpu.br` to build the full sequence embedding in a single fused GPU kernel launch, eliminating the iterative per-token loop and `kv_append_gpu` reallocations in `TextDecoder.forward`.
-- **End-to-End 100% GPU Transcription Pipeline** (`src/model.br`, `src/audio_gpu.br`, `examples/transcribe.br`):
-  - Connected `log_mel_spectrogram_gpu` and `encoder_forward_gpu` directly into `Whisper.transcribe`, keeping the 768,000 encoder output floats resident in GPU memory across encoder and decoder.
+- **End-to-End 100% GPU Transcription Pipeline** (`src/model.br`, `src/audio_gpu.br`, `src/encoder.br`, `examples/transcribe.br`):
+  - Added `log_mel_spectrogram_gpu_resident` (`StftPowerDirect` with inline GPU reflect-padding, fused `MelApplyLog`, 2-stage GPU max reduction `MaxFloatStage1Kernel`/`MaxFloatStage2Kernel`, and `MelNormalizeTransposeKernel` outputting directly in `(3000 × 80)` layout) and `encoder_forward_from_gpu_mel`, eliminating all CPU reflect-padding loops, normalization readbacks, and `transpose_gpu` launches.
+  - Connected `log_mel_spectrogram_gpu_resident` and `encoder_forward_from_gpu_mel` directly into `Whisper.transcribe`, keeping tensors 100% GPU-resident from raw WAV audio samples to decoded token IDs.
   - Rewrote `StftPower` kernel in `src/audio_gpu.br` using direct trigonometric evaluation without dynamic vector heap allocations (`[]` / `.push`), unlocking native WGSL, Metal MSL, and CUDA shader compatibility for GPU mel spectrogram extraction.
   - Added cached precomputed tables `CACHED_HANN_400` and `CACHED_MEL_FB_80` in `src/audio_gpu.br`, avoiding recurrent CPU recalculations of the Hann window and Mel filterbank on each clip.
 - **Full `float32` migration & Boring v0.9.14+ compatibility** (`src/*.br`, `test/*.br`, `examples/*.br`):

@@ -177,3 +177,170 @@ pub req MelSpectrogram log_mel_spectrogram_gpu([float32] audio) throws:
             fixed[m * 3000 + f] = normed
 
     MelSpectrogram(3000, n_mels, fixed)
+
+# ── Fully GPU-resident log-mel spectrogram (zero CPU copies/loops) ────────────
+# Performs reflect padding inline on GPU, fuses MelApply + LogCompress, reduces
+# global max on GPU, and outputs directly in (3000 × 80) row-major layout for Conv1d.
+
+kernel StftPowerDirect:
+    let [float32]'global               audio     # raw unpadded audio
+    let [float32]'global               win       # Hann window (n_fft)
+    mut [float32, freq, frame]'unified power     # output: n_freq × n_frames
+    let int                            hop
+    let int                            n_audio
+    let int                            n_fft
+    let int                            pad
+
+    init([float32]'global a, [float32]'global w, int nf, int h, int na, int nfft, int nfreq):
+        audio   = a
+        win     = w
+        hop     = h
+        n_audio = na
+        n_fft   = nfft
+        pad     = nfft / 2
+        power   = [0.0 as float32 for freq = nfreq, frame = nf]
+
+    def ():
+        let frame = .thread.x + .block.x * .block_dim.x
+        if frame < power.frame:
+            let start = frame * hop
+            for k in 0..<power.freq:
+                var float32 re = 0.0 as float32
+                var float32 im = 0.0 as float32
+                for i in 0..<n_fft:
+                    let int raw_pos = start + i - pad
+                    let int src = if raw_pos < 0:
+                        -raw_pos
+                    elif raw_pos >= n_audio:
+                        2 * n_audio - 2 - raw_pos
+                    else:
+                        raw_pos
+                    let float32 sample = if src >= 0 and src < n_audio: audio[src] else: (0.0 as float32)
+                    let float32 s = sample * win[i]
+                    let float32 ang = -2.0 * PI * ((k * i % n_fft) as float32) / (n_fft as float32)
+                    re += s * ang.cos()
+                    im += s * ang.sin()
+                power[freq = k, frame = frame] = re * re + im * im
+
+kernel MelApplyLog:
+    let [float32, freq, mel]'global    fb
+    let [float32, freq, frame]'global  power
+    mut [float32, frame, mel]'unified  mel_log
+    let float32                        clamp_val
+
+    init([float32]'global f, [float32]'global p, int nm, int nf, int nfq, float32 cv):
+        fb        = f.reshape(freq = nfq, mel = nm)
+        power     = p.reshape(freq = nfq, frame = nf)
+        mel_log   = [0.0 as float32 for frame = nf, mel = nm]
+        clamp_val = cv
+
+    def ():
+        let f = .thread.x + .block.x * .block_dim.x
+        if f < mel_log.frame:
+            for m in 0..<mel_log.mel:
+                var float32 s = 0.0 as float32
+                for k in 0..<fb.freq:
+                    s += fb[freq = k, mel = m] * power[freq = k, frame = f]
+                let float32 c = if s > clamp_val: s else: clamp_val
+                mel_log[frame = f, mel = m] = c.log10()
+
+kernel MaxFloatStage1Kernel:
+    let [float32]'global  x
+    mut [float32]'unified part_max
+    let int n
+
+    init([float32]'global xi, int ni):
+        x        = xi
+        n        = ni
+        part_max = [-1.0e30 as float32 for ..<256]
+
+    def ():
+        let tid = .thread.x
+        var float32 best = -1.0e30 as float32
+        var int i = tid
+        while i < n:
+            let float32 v = x[i]
+            if v > best: best = v
+            i += 256
+        part_max[tid] = best
+
+kernel MaxFloatStage2Kernel:
+    let [float32]'global  part_max
+    mut [float32]'unified max_out
+
+    init([float32]'global pm):
+        part_max = pm
+        max_out  = [0.0 as float32]
+
+    def ():
+        var float32 best = part_max[0]
+        for i in 1..<256:
+            let float32 v = part_max[i]
+            if v > best: best = v
+        max_out[0] = best
+
+kernel MelNormalizeTransposeKernel:
+    let [float32, frame, mel]'global mel_log
+    let [float32]'global             max_buf
+    mut [float32]'unified            out      # (3000 × n_mels), frame-major for conv1d_gpu
+    let int                          cols
+    let int                          n_mels
+
+    init([float32]'global ml, [float32]'global mb, int nf, int nm, int c):
+        mel_log = ml.reshape(frame = nf, mel = nm)
+        max_buf = mb
+        n_mels  = nm
+        cols    = c
+        out     = [0.0 as float32 for ..<3000 * nm]
+
+    def ():
+        let f = .thread.x + .block.x * .block_dim.x
+        if f < cols:
+            let float32 floor_ = max_buf[0] - (8.0 as float32)
+            for m in 0..<n_mels:
+                let float32 raw    = mel_log[frame = f, mel = m]
+                let float32 normed = ((if raw > floor_: raw else: floor_) + (4.0 as float32)) / (4.0 as float32)
+                out[f * n_mels + m] = normed
+
+# Returns (gpu_mel_transposed_3000x80, n_frames_fixed=3000, n_mels=80)
+pub req ([float32]'kernel'unified, int, int) log_mel_spectrogram_gpu_resident([float32]'kernel'global audio) throws:
+    let int n_audio = audio.length
+    let int n_fft   = 400
+    let int hop     = 160
+    let int n_mels  = 80
+    let int n_freq  = n_fft / 2 + 1
+
+    let int n_frames = n_audio / hop
+    guard n_frames > 0 else throw "audio too short (<10ms) for mel spectrogram"
+
+    let [float32] win = get_cached_hann_400()
+    let [float32] fb  = get_cached_mel_fb_80()
+
+    let int stft_blocks = (n_frames + 255) / 256
+    mut k_stft = StftPowerDirect(audio, win, n_frames, hop, n_audio, n_fft, n_freq)
+    kernel:
+        k_stft(block = 256, grid = stft_blocks)
+
+    mut k_mel = MelApplyLog(fb, k_stft.power, n_mels, n_frames, n_freq, 1e-10 as float32)
+    kernel:
+        k_mel(block = 256, grid = stft_blocks)
+
+    let int total_mel = n_mels * n_frames
+    mut k_max1 = MaxFloatStage1Kernel(k_mel.mel_log, total_mel)
+    kernel:
+        k_max1(block = 256, grid = 1)
+    mut k_max2 = MaxFloatStage2Kernel(k_max1.part_max)
+    kernel:
+        k_max2(block = 1, grid = 1)
+
+    if n_frames > 3000:
+        let float32 total_secs = ((n_frames * hop) as float32) / (SAMPLE_RATE as float32)
+        warn "audio is {total_secs:.1f}s, truncating to the first 30s (no windowed chunking yet)"
+    let int cols = if n_frames < 3000: n_frames else: 3000
+
+    let int norm_blocks = (cols + 255) / 256
+    mut k_norm = MelNormalizeTransposeKernel(k_mel.mel_log, k_max2.max_out, n_frames, n_mels, cols)
+    kernel:
+        k_norm(block = 256, grid = norm_blocks)
+
+    (k_norm.out, 3000, n_mels)

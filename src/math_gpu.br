@@ -637,6 +637,32 @@ pub req [float32]'kernel'unified mha_cross_step_gpu([float32]'kernel'global x_ne
     let [float32]'kernel'unified concat = attention_heads_gpu(q_new, cache_k, cache_v, 1, seq_a, d, n_head, false)
     linear_gpu(concat, w_o, b_o, 1, d, d)
 
+# ── Batched prompt prefill attention (populates initial KV-cache in 1 pass) ──
+
+pub req ([float32]'kernel'unified, [float32]'kernel'unified, [float32]'kernel'unified) mha_prefill_nobias_k_gpu(
+                    [float32]'kernel'global x,
+                    [float32]'kernel'global w_q,  [float32]'kernel'global b_q,
+                    [float32]'kernel'global w_k,
+                    [float32]'kernel'global w_v,  [float32]'kernel'global b_v,
+                    [float32]'kernel'global w_o,  [float32]'kernel'global b_o,
+                    int seq_t, int d, int n_head) throws:
+    let [float32]'kernel'unified Q = linear_gpu(x, w_q, b_q, seq_t, d, d)
+    let [float32]'kernel'unified K = linear_nobias_gpu(x, w_k, seq_t, d, d)
+    let [float32]'kernel'unified V = linear_gpu(x, w_v, b_v, seq_t, d, d)
+    let [float32]'kernel'unified concat = attention_heads_gpu(Q, K, V, seq_t, seq_t, d, n_head, true)
+    let [float32]'kernel'unified out = linear_gpu(concat, w_o, b_o, seq_t, d, d)
+    (out, K, V)
+
+pub req [float32]'kernel'unified mha_cross_prefill_gpu(
+                    [float32]'kernel'global x,
+                    [float32]'kernel'global w_q, [float32]'kernel'global b_q,
+                    [float32]'kernel'global cache_k, [float32]'kernel'global cache_v,
+                    [float32]'kernel'global w_o, [float32]'kernel'global b_o,
+                    int seq_t, int seq_a, int d, int n_head) throws:
+    let [float32]'kernel'unified Q = linear_gpu(x, w_q, b_q, seq_t, d, d)
+    let [float32]'kernel'unified concat = attention_heads_gpu(Q, cache_k, cache_v, seq_t, seq_a, d, n_head, false)
+    linear_gpu(concat, w_o, b_o, seq_t, d, d)
+
 # ── Kernel: LayerNorm (row-wise warp-shuffle reduction, 32 threads/row) ──────
 
 pub req [float32]'kernel'unified layer_norm_seq_gpu([float32]'kernel'global x, [float32]'kernel'global w, [float32]'kernel'global b,

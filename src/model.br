@@ -49,15 +49,15 @@ struct Whisper:
     mut TextDecoder decoder
     Tokenizer       tokenizer
 
-    # Full transcription pipeline: audio path → transcript string (100% GPU resident).
+    # Full transcription pipeline: audio path → transcript string (100% GPU resident from raw audio to tokens).
     def string transcribe(string audio_path) throws:
         let [float32]        samples   = load_wav(audio_path)
         print "[diag] loaded {samples.length} samples"
-        let MelSpectrogram   mel       = log_mel_spectrogram_gpu(samples)
-        print "[diag] mel: {mel.n_frames} frames"
-        let [float32]'kernel'unified audio = encoder_forward_gpu(self.encoder, mel)
+        let ([float32]'kernel'unified mel_t, int n_frames, int n_mels) = log_mel_spectrogram_gpu_resident(samples)
+        print "[diag] mel: {n_frames} frames (GPU-resident)"
+        let [float32]'kernel'unified audio = encoder_forward_from_gpu_mel(self.encoder, mel_t, n_frames, n_mels)
         print "[diag] encoder done"
-        let int              seq_a     = mel.n_frames / 2  # halved by conv2 stride=2
+        let int              seq_a     = n_frames / 2  # halved by conv2 stride=2
         let [int]            ids       = self.decoder.generate(audio, seq_a, 448)
         print "[diag] decoder done: {ids.length} tokens"
         self.tokenizer.decode(ids)
